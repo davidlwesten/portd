@@ -19,6 +19,13 @@ on_gateway_changed(void *userdata, size_t family, gateway_t const *gateway) {
   }
 }
 
+static int on_signal(sd_event_source * /*source*/,
+                     struct signalfd_siginfo const * /*info*/,
+                     void *userdata) {
+  client_stop(userdata);
+  return 0;
+}
+
 int main(void) {
   sd_event *event = nullptr;
   int r = sd_event_default(&event);
@@ -27,12 +34,12 @@ int main(void) {
     return EXIT_FAILURE;
   }
 
-  // Without a handler, the signal exits the loop with the userdata as the code
+  client_t client = {.event = event};
   int const signals[] = {SIGTERM, SIGINT};
   for (size_t i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
     r = sd_event_add_signal(event, nullptr,
-                            signals[i] | SD_EVENT_SIGNAL_PROCMASK, nullptr,
-                            nullptr);
+                            signals[i] | SD_EVENT_SIGNAL_PROCMASK, on_signal,
+                            &client);
     if (r < 0) {
       fprintf(stderr, "portd: handling signals: %s\n", strerror(-r));
       sd_event_unref(event);
@@ -40,7 +47,6 @@ int main(void) {
     }
   }
 
-  client_t client = {.event = event};
   gateway_monitor_t gateways;
   r = gateway_monitor_start(&gateways, event, on_gateway_changed, &client);
   if (r < 0) {

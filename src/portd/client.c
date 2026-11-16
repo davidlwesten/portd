@@ -70,6 +70,9 @@ static void run(client_t *client) {
               (unsigned)event.failed.handle, (unsigned)event.failed.result);
       break;
     case PCP_EVENT_TIMEOUT:
+      if (client->stopping && !event.timeout.deadline.has_value) {
+        sd_event_exit(client->event, 0);
+      }
       schedule(client, event.timeout.deadline);
       return;
     default:
@@ -139,6 +142,11 @@ on_timer(sd_event_source * /*source*/, uint64_t /*usec*/, void *userdata) {
 
 int client_connect(client_t *client, gateway_t const *gateway) {
   client_disconnect(client);
+  if (client->stopping) {
+    // The mappings on the old gateway can't be released anymore
+    sd_event_exit(client->event, 0);
+    return 0;
+  }
   if (gateway->ifindex == 0) {
     return 0;
   }
@@ -173,9 +181,20 @@ int client_connect(client_t *client, gateway_t const *gateway) {
     client_disconnect(client);
     return -handle.error;
   }
+  client->mapping = handle.value;
 
   run(client);
   return 0;
+}
+
+void client_stop(client_t *client) {
+  if (client->stopping || client->session == nullptr) {
+    sd_event_exit(client->event, 0);
+    return;
+  }
+  client->stopping = true;
+  pcp_session_release(client->session, client->mapping);
+  run(client);
 }
 
 void client_disconnect(client_t *client) {
