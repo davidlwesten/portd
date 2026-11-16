@@ -1,5 +1,7 @@
 #include "gateway.h"
 
+#include "errors.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <net/if.h>
@@ -79,17 +81,8 @@ static int on_route(struct nlmsghdr const *nlh, void *data) {
   return MNL_CB_OK;
 }
 
-static int dump_routes(candidate_t candidates[GATEWAY_FAMILIES]) {
-  struct mnl_socket *socket = mnl_socket_open2(NETLINK_ROUTE, SOCK_CLOEXEC);
-  if (socket == nullptr) {
-    return -errno;
-  }
-  int r = 0;
-  if (mnl_socket_bind(socket, 0, MNL_SOCKET_AUTOPID) < 0) {
-    r = -errno;
-    goto out;
-  }
-
+[[nodiscard]] static int request_routes(struct mnl_socket *socket,
+                                        candidate_t candidates[]) {
   alignas(struct nlmsghdr) char buffer[MNL_SOCKET_DUMP_SIZE];
   struct nlmsghdr *nlh = mnl_nlmsg_put_header(buffer);
   nlh->nlmsg_type = RTM_GETROUTE;
@@ -98,8 +91,7 @@ static int dump_routes(candidate_t candidates[GATEWAY_FAMILIES]) {
   struct rtmsg *rtm = mnl_nlmsg_put_extra_header(nlh, sizeof(*rtm));
   rtm->rtm_family = AF_UNSPEC;
   if (mnl_socket_sendto(socket, nlh, nlh->nlmsg_len) < 0) {
-    r = -errno;
-    goto out;
+    return -errno;
   }
 
   unsigned const portid = mnl_socket_get_portid(socket);
@@ -107,16 +99,23 @@ static int dump_routes(candidate_t candidates[GATEWAY_FAMILIES]) {
   do {
     ssize_t const size = mnl_socket_recvfrom(socket, buffer, sizeof(buffer));
     if (size < 0) {
-      r = -errno;
-      goto out;
+      return -errno;
     }
-    status = mnl_cb_run(buffer, (size_t)size, 1, portid, on_route, candidates);
+    status = errno_or(
+        mnl_cb_run(buffer, (size_t)size, 1, portid, on_route, candidates));
   } while (status > MNL_CB_STOP);
-  if (status < 0) {
-    r = -errno;
-  }
+  return status;
+}
 
-out:
+[[nodiscard]] static int dump_routes(candidate_t candidates[]) {
+  struct mnl_socket *socket = mnl_socket_open2(NETLINK_ROUTE, SOCK_CLOEXEC);
+  if (socket == nullptr) {
+    return -errno;
+  }
+  int r = errno_or(mnl_socket_bind(socket, 0, MNL_SOCKET_AUTOPID));
+  if (r >= 0) {
+    r = request_routes(socket, candidates);
+  }
   mnl_socket_close(socket);
   return r;
 }
@@ -188,17 +187,17 @@ int gateway_monitor_start(gateway_monitor_t *monitor, sd_event *event) {
   }
 
   // Subscribed before the first dump, so no change in between gets lost
-  int r = 0;
-  if (mnl_socket_bind(monitor->socket, RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE,
-                      MNL_SOCKET_AUTOPID) < 0) {
-    r = -errno;
-  } else {
-    r = sd_event_add_io(event, nullptr, mnl_socket_get_fd(monitor->socket),
-                        EPOLLIN, on_route_change, monitor);
-  }
+  int r = errno_or(mnl_socket_bind(monitor->socket,
+                                   RTMGRP_IPV4_ROUTE | RTMGRP_IPV6_ROUTE,
+                                   MNL_SOCKET_AUTOPID));
   if (r < 0) {
-    mnl_socket_close(monitor->socket);
-    monitor->socket = nullptr;
+    gateway_monitor_stop(monitor);
+    return r;
+  }
+  r = sd_event_add_io(event, nullptr, mnl_socket_get_fd(monitor->socket),
+                      EPOLLIN, on_route_change, monitor);
+  if (r < 0) {
+    gateway_monitor_stop(monitor);
     return r;
   }
 

@@ -25,7 +25,8 @@ typedef struct gateway_monitor {
 
 // Each family's gateway is the one on its lowest-metric default route in the
 // main table
-int gateway_monitor_start(gateway_monitor_t *monitor, sd_event *event);
+[[nodiscard]] int gateway_monitor_start(gateway_monitor_t *monitor,
+                                        sd_event *event);
 
 // Only after freeing the event loop, which watches the socket until then
 void gateway_monitor_stop(gateway_monitor_t *monitor);
