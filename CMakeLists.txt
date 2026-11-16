@@ -12,6 +12,7 @@ set(CMAKE_C_EXTENSIONS OFF)
 set(CMAKE_COMPILE_WARNING_AS_ERROR ${PORTD_WARNINGS_AS_ERRORS})
 
 find_package(PkgConfig REQUIRED)
+pkg_check_modules(libmnl REQUIRED IMPORTED_TARGET libmnl)
 pkg_check_modules(libsystemd REQUIRED IMPORTED_TARGET libsystemd>=253)
 
 add_subdirectory(src/portd)

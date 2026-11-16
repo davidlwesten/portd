@@ -5,6 +5,8 @@
 
 #include <systemd/sd-event.h>
 
+#include "gateway.h"
+
 int main(void) {
   sd_event *event = nullptr;
   int r = sd_event_default(&event);
@@ -26,8 +28,17 @@ int main(void) {
     }
   }
 
+  gateway_monitor_t gateways;
+  r = gateway_monitor_start(&gateways, event);
+  if (r < 0) {
+    fprintf(stderr, "portd: following route changes: %s\n", strerror(-r));
+    sd_event_unref(event);
+    return EXIT_FAILURE;
+  }
+
   r = sd_event_loop(event);
   sd_event_unref(event);
+  gateway_monitor_stop(&gateways);
   if (r < 0) {
     fprintf(stderr, "portd: event loop: %s\n", strerror(-r));
     return EXIT_FAILURE;
