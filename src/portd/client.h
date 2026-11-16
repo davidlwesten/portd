@@ -12,6 +12,8 @@ typedef struct client {
   sd_event *event;
   // Owns the socket connected to the gateway
   sd_event_source *socket;
+  // Owns the socket for the gateway's announcements, if it could be opened
+  sd_event_source *announcements;
   sd_event_source *timer;
   // At most one of the sessions, PCP first, and neither while there's no
   // gateway

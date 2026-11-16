@@ -12,7 +12,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define PCP_SERVER_PORT 5351
+#define SERVER_PORT 5351
+#define ANNOUNCE_PORT 5350
 
 // Until mappings can be requested over D-Bus
 #define TEST_PORT 12345
@@ -217,37 +218,93 @@ on_timer(sd_event_source * /*source*/, uint64_t /*usec*/, void *userdata) {
   return 0;
 }
 
-[[nodiscard]] static int open_socket(client_t *client,
-                                     gateway_t const *gateway,
-                                     struct sockaddr_in *local) {
+// The socket is owned by `*source`
+[[nodiscard]] static int add_socket(client_t *client,
+                                    sd_event_source **source) {
   int const fd =
       errno_or(socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
   if (fd < 0) {
     return fd;
   }
-  int r = sd_event_add_io(client->event, &client->socket, fd, EPOLLIN,
-                          on_datagram, client);
+  int r =
+      sd_event_add_io(client->event, source, fd, EPOLLIN, on_datagram, client);
   if (r < 0) {
     close(fd);
     return r;
   }
-  r = sd_event_source_set_io_fd_own(client->socket, true);
+  r = sd_event_source_set_io_fd_own(*source, true);
   if (r < 0) {
     close(fd);
     return r;
   }
+  return fd;
+}
 
+[[nodiscard]] static int connect_to_server(int fd, gateway_t const *gateway) {
   struct sockaddr_in server = {
       .sin_family = AF_INET,
-      .sin_port = htons(PCP_SERVER_PORT),
+      .sin_port = htons(SERVER_PORT),
   };
   memcpy(&server.sin_addr, gateway->address, sizeof(server.sin_addr));
-  r = errno_or(connect(fd, (struct sockaddr *)&server, sizeof(server)));
+  return errno_or(connect(fd, (struct sockaddr *)&server, sizeof(server)));
+}
+
+[[nodiscard]] static int open_socket(client_t *client,
+                                     gateway_t const *gateway,
+                                     struct sockaddr_in *local) {
+  int const fd = add_socket(client, &client->socket);
+  if (fd < 0) {
+    return fd;
+  }
+  int const r = connect_to_server(fd, gateway);
   if (r < 0) {
     return r;
   }
   socklen_t size = sizeof(*local);
   return errno_or(getsockname(fd, (struct sockaddr *)local, &size));
+}
+
+// The server announces from its own port to 224.0.0.1, so connecting to it
+// leaves out everyone else's announcements
+[[nodiscard]] static int open_announcements(client_t *client,
+                                            gateway_t const *gateway) {
+  int const fd = add_socket(client, &client->announcements);
+  if (fd < 0) {
+    return fd;
+  }
+
+  // Other clients on this host may be listening too
+  int const on = 1;
+  int r = errno_or(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)));
+  if (r < 0) {
+    return r;
+  }
+  // Only the group joined on the gateway's interface below
+  int const off = 0;
+  r = errno_or(setsockopt(fd, IPPROTO_IP, IP_MULTICAST_ALL, &off, sizeof(off)));
+  if (r < 0) {
+    return r;
+  }
+
+  struct sockaddr_in const group = {
+      .sin_family = AF_INET,
+      .sin_port = htons(ANNOUNCE_PORT),
+      .sin_addr.s_addr = htonl(INADDR_ALLHOSTS_GROUP),
+  };
+  r = errno_or(bind(fd, (struct sockaddr const *)&group, sizeof(group)));
+  if (r < 0) {
+    return r;
+  }
+  struct ip_mreqn const membership = {
+      .imr_multiaddr = group.sin_addr,
+      .imr_ifindex = (int)gateway->ifindex,
+  };
+  r = errno_or(setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &membership,
+                          sizeof(membership)));
+  if (r < 0) {
+    return r;
+  }
+  return connect_to_server(fd, gateway);
 }
 
 int client_connect(client_t *client, gateway_t const *gateway) {
@@ -266,6 +323,13 @@ int client_connect(client_t *client, gateway_t const *gateway) {
   if (r < 0) {
     client_disconnect(client);
     return r;
+  }
+  r = open_announcements(client, gateway);
+  if (r < 0) {
+    fprintf(stderr, "portd: not listening for announcements: %s\n",
+            strerror(-r));
+    client->announcements =
+        sd_event_source_disable_unref(client->announcements);
   }
   r = sd_event_add_time(client->event, &client->timer, CLOCK_MONOTONIC, 0, 0,
                         on_timer, client);
@@ -318,5 +382,6 @@ void client_disconnect(client_t *client) {
     client->natpmp = nullptr;
   }
   client->socket = sd_event_source_disable_unref(client->socket);
+  client->announcements = sd_event_source_disable_unref(client->announcements);
   client->timer = sd_event_source_disable_unref(client->timer);
 }
