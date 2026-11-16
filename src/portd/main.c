@@ -5,7 +5,19 @@
 
 #include <systemd/sd-event.h>
 
+#include "client.h"
 #include "gateway.h"
+
+static void
+on_gateway_changed(void *userdata, size_t family, gateway_t const *gateway) {
+  if (family != GATEWAY_IPV4) {
+    return;
+  }
+  int const r = client_connect(userdata, gateway);
+  if (r < 0) {
+    fprintf(stderr, "portd: connecting to the gateway: %s\n", strerror(-r));
+  }
+}
 
 int main(void) {
   sd_event *event = nullptr;
@@ -28,8 +40,9 @@ int main(void) {
     }
   }
 
+  client_t client = {.event = event};
   gateway_monitor_t gateways;
-  r = gateway_monitor_start(&gateways, event);
+  r = gateway_monitor_start(&gateways, event, on_gateway_changed, &client);
   if (r < 0) {
     fprintf(stderr, "portd: following route changes: %s\n", strerror(-r));
     sd_event_unref(event);
@@ -37,6 +50,7 @@ int main(void) {
   }
 
   r = sd_event_loop(event);
+  client_disconnect(&client);
   sd_event_unref(event);
   gateway_monitor_stop(&gateways);
   if (r < 0) {

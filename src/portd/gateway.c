@@ -156,6 +156,7 @@ static void sync_gateways(gateway_monitor_t *monitor) {
     if (!gateway_equal(gateway, &monitor->gateways[family])) {
       monitor->gateways[family] = *gateway;
       log_gateway(family, gateway);
+      monitor->changed(monitor->userdata, family, gateway);
     }
   }
 }
@@ -178,8 +179,11 @@ static int on_route_change(sd_event_source * /*source*/,
   return 0;
 }
 
-int gateway_monitor_start(gateway_monitor_t *monitor, sd_event *event) {
-  *monitor = (gateway_monitor_t){};
+int gateway_monitor_start(gateway_monitor_t *monitor,
+                          sd_event *event,
+                          gateway_changed_t *changed,
+                          void *userdata) {
+  *monitor = (gateway_monitor_t){.changed = changed, .userdata = userdata};
   monitor->socket =
       mnl_socket_open2(NETLINK_ROUTE, SOCK_NONBLOCK | SOCK_CLOEXEC);
   if (monitor->socket == nullptr) {
