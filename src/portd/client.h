@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include <byo/natpmp/natpmp.h>
 #include <byo/pcp/pcp.h>
 #include <systemd/sd-event.h>
 
@@ -12,9 +13,14 @@ typedef struct client {
   // Owns the socket connected to the gateway
   sd_event_source *socket;
   sd_event_source *timer;
-  // Null while there's no gateway
-  pcp_session_t *session;
-  pcp_handle_t mapping;
+  // At most one of the sessions, PCP first, and neither while there's no
+  // gateway
+  pcp_session_t *pcp;
+  natpmp_session_t *natpmp;
+  union {
+    pcp_handle_t pcp;
+    natpmp_handle_t natpmp;
+  } mapping;
   bool stopping;
   uint8_t buffer[PCP_PACKET_MAX_SIZE];
 } client_t;

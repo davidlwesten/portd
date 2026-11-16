@@ -18,7 +18,13 @@ FetchContent_Declare(
   GIT_TAG v1.0.0
   GIT_SHALLOW TRUE
   FIND_PACKAGE_ARGS 1.0)
-FetchContent_MakeAvailable(byo-pcp)
+FetchContent_Declare(
+  byo-natpmp
+  GIT_REPOSITORY https://github.com/byo-io/libnatpmp.git
+  GIT_TAG v1.0.0
+  GIT_SHALLOW TRUE
+  FIND_PACKAGE_ARGS 1.0)
+FetchContent_MakeAvailable(byo-pcp byo-natpmp)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(libmnl REQUIRED IMPORTED_TARGET libmnl)
