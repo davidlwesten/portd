@@ -1,4 +1,6 @@
 #include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <unity.h>
@@ -238,15 +240,25 @@ static void test_full_session_refuses(void) {
   TEST_ASSERT_EQUAL_UINT16(second, map(NAT_PROTOCOL_UDP, 4));
 }
 
-int main(void) {
+// Runs the test named on the command line, or all of them
+#define RUN(test)                                                              \
+  if (argc < 2 || strcmp(argv[1], #test) == 0) {                               \
+    RUN_TEST(test);                                                            \
+  }
+
+int main(int argc, char *argv[]) {
   UNITY_BEGIN();
-  RUN_TEST(test_pcp_maps);
-  RUN_TEST(test_pcp_suggests_the_last_address);
-  RUN_TEST(test_pcp_refusal_is_translated);
-  RUN_TEST(test_fall_back_keeps_handles);
-  RUN_TEST(test_natpmp_refusal_is_translated);
-  RUN_TEST(test_natpmp_unreachable_fails);
-  RUN_TEST(test_release_deletes);
-  RUN_TEST(test_full_session_refuses);
+  RUN(test_pcp_maps);
+  RUN(test_pcp_suggests_the_last_address);
+  RUN(test_pcp_refusal_is_translated);
+  RUN(test_fall_back_keeps_handles);
+  RUN(test_natpmp_refusal_is_translated);
+  RUN(test_natpmp_unreachable_fails);
+  RUN(test_release_deletes);
+  RUN(test_full_session_refuses);
+  if (Unity.NumberOfTests == 0) {
+    fprintf(stderr, "no test named %s\n", argv[1]);
+    return EXIT_FAILURE;
+  }
   return UNITY_END();
 }

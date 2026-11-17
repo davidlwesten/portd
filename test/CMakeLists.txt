@@ -15,4 +15,11 @@ target_link_libraries(nat_test PRIVATE portd_warnings byo::natpmp byo::pcp
 target_compile_options(nat_test PRIVATE -fsanitize=address,undefined
                        -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
 target_link_options(nat_test PRIVATE -fsanitize=address,undefined)
-add_test(NAME nat COMMAND nat_test)
+
+# One test each, named after the RUN lines in main
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS nat.c)
+file(STRINGS nat.c runs REGEX "^  RUN\\(test_[a-z0-9_]+\\);$")
+foreach(run IN LISTS runs)
+  string(REGEX REPLACE "^  RUN\\(test_([a-z0-9_]+)\\);$" "\\1" name "${run}")
+  add_test(NAME nat.${name} COMMAND nat_test test_${name})
+endforeach()
