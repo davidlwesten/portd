@@ -25,7 +25,7 @@ struct nat_session {
   pcp_session_t *pcp;
   // Created along with the PCP session, so falling back can't fail
   natpmp_session_t *natpmp;
-  // From NAT-PMP, 0.0.0.0 until known
+  // The last one the gateway gave, 0.0.0.0 until known
   pcp_ip_address_t external;
   uint8_t buffer[PCP_PACKET_MAX_SIZE];
   nat_mapping_t mappings[];
@@ -103,7 +103,7 @@ static nat_mapping_t *find_inner(nat_session_t *session, uint16_t handle) {
     pcp_handle_or_error_t const handle = pcp_session_map_request(
         session->pcp, mapping->lifetime, (pcp_protocol_t)mapping->protocol,
         mapping->port,
-        (pcp_socket_address_t){.ip = pcp_ip_address_any_v4,
+        (pcp_socket_address_t){.ip = session->external,
                                .port = mapping->external_port},
         0, nullptr);
     if (!handle.has_value) {
@@ -213,6 +213,7 @@ static nat_event_t poll_pcp(nat_session_t *session, uint64_t now) {
     case PCP_EVENT_MAPPED:
       mapping = find_inner(session, event.mapped.handle);
       if (mapping != nullptr) {
+        session->external = event.mapped.external.ip;
         return (nat_event_t){.type = NAT_EVENT_MAPPED,
                              .mapped = {.handle = handle_of(session, mapping),
                                         .external = event.mapped.external}};

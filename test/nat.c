@@ -148,6 +148,20 @@ static void test_pcp_maps(void) {
   TEST_ASSERT_EQUAL(NAT_GATEWAY_PROTOCOL_PCP, nat_session_protocol(session));
 }
 
+static void test_pcp_suggests_the_last_address(void) {
+  map(NAT_PROTOCOL_UDP, 12345);
+  expect_idle();
+  pcp_ip_address_t const any = pcp_ip_address_any_v4;
+  TEST_ASSERT_EQUAL_MEMORY(&any, &sent[44], sizeof(any));
+  answer_pcp(0, 40345);
+  poll_event();
+
+  map(NAT_PROTOCOL_TCP, 8080);
+  expect_idle();
+  pcp_ip_address_t const external = pcp_ip_address_from_octets(203, 0, 113, 7);
+  TEST_ASSERT_EQUAL_MEMORY(&external, &sent[44], sizeof(external));
+}
+
 static void test_pcp_refusal_is_translated(void) {
   nat_handle_t const handle = map(NAT_PROTOCOL_TCP, 8080);
   expect_idle();
@@ -227,6 +241,7 @@ static void test_full_session_refuses(void) {
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_pcp_maps);
+  RUN_TEST(test_pcp_suggests_the_last_address);
   RUN_TEST(test_pcp_refusal_is_translated);
   RUN_TEST(test_fall_back_keeps_handles);
   RUN_TEST(test_natpmp_refusal_is_translated);

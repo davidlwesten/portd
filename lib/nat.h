@@ -56,7 +56,8 @@ typedef enum nat_protocol {
   NAT_PROTOCOL_UDP = 17,
 } nat_protocol_t;
 
-// `external_port` is the one to suggest, 0 for any
+// `external_port` is the one to suggest, 0 for any. With PCP, the external
+// address suggested is the last one the gateway gave.
 nat_handle_or_error_t nat_session_map_request(nat_session_t *session,
                                               uint32_t lifetime,
                                               nat_protocol_t protocol,
