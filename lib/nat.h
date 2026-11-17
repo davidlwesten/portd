@@ -3,28 +3,23 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <byo/pcp/ip.h>
+#include <byo/pcp/pcp.h>
 
 // A port mapping session with one gateway, without any I/O like the PCP and
 // NAT-PMP sessions it wraps: PCP first, and NAT-PMP if the gateway only speaks
 // that. Handles stay the same when it falls back.
 
-typedef struct nat_rng {
-  bool (*fill)(void *ctx, size_t size, uint8_t data[]);
-  void *ctx;
-} nat_rng_t;
-
 typedef struct nat_config {
   // Our address as the gateway sees it
   pcp_ip_address_t local;
-  nat_rng_t rng;
+  pcp_rng_t rng;
   // How many mappings the session can hold at once. With NAT-PMP, a released
   // mapping still counts until its deletion is done.
   uint16_t capacity;
 } nat_config_t;
 
 // The largest datagram either protocol sends or receives
-static constexpr size_t NAT_PACKET_MAX_SIZE = 1100;
+static constexpr size_t NAT_PACKET_MAX_SIZE = PCP_PACKET_MAX_SIZE;
 
 typedef struct nat_session nat_session_t;
 
@@ -115,21 +110,18 @@ typedef struct nat_event {
     } failed;
     struct {
       // Empty if nothing is scheduled
-      struct {
-        bool has_value;
-        uint64_t value;
-      } deadline;
+      pcp_optional_time_ms_t deadline;
     } timeout;
   };
 } nat_event_t;
 
 // Call until it returns NAT_EVENT_TIMEOUT whenever something happens, with
 // milliseconds from a monotonic clock
-nat_event_t nat_session_poll(nat_session_t *session, uint64_t now);
+nat_event_t nat_session_poll(nat_session_t *session, pcp_time_ms_t now);
 
 // Only datagrams from the gateway, its answers and its announcements
 void nat_session_on_datagram(nat_session_t *session,
-                             uint64_t now,
+                             pcp_time_ms_t now,
                              size_t size,
                              uint8_t const data[]);
 

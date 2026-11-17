@@ -7,8 +7,6 @@
 #include <byo/natpmp/natpmp.h>
 #include <byo/pcp/pcp.h>
 
-static_assert(NAT_PACKET_MAX_SIZE == PCP_PACKET_MAX_SIZE);
-
 typedef struct nat_mapping {
   // 0 for a free slot
   uint32_t lifetime;
@@ -44,7 +42,7 @@ nat_session_t *nat_session_begin(nat_config_t config) {
 
   session->pcp = pcp_session_begin((pcp_config_t){
       .local = config.local,
-      .rng = {.fill = config.rng.fill, .ctx = config.rng.ctx},
+      .rng = config.rng,
       .buffer = {.size = sizeof(session->buffer), .data = session->buffer},
   });
   session->natpmp = natpmp_session_begin((natpmp_config_t){
@@ -201,7 +199,7 @@ static nat_result_t from_natpmp(natpmp_result_t result) {
   }
 }
 
-static nat_event_t poll_pcp(nat_session_t *session, uint64_t now) {
+static nat_event_t poll_pcp(nat_session_t *session, pcp_time_ms_t now) {
   for (;;) {
     pcp_event_t const event = pcp_session_poll(session->pcp, now);
     nat_mapping_t *mapping;
@@ -241,17 +239,15 @@ static nat_event_t poll_pcp(nat_session_t *session, uint64_t now) {
                            .failed = {.handle = handle_of(session, mapping),
                                       .result = from_pcp(event.failed.result)}};
     case PCP_EVENT_TIMEOUT:
-      return (nat_event_t){
-          .type = NAT_EVENT_TIMEOUT,
-          .timeout.deadline = {.has_value = event.timeout.deadline.has_value,
-                               .value = event.timeout.deadline.value}};
+      return (nat_event_t){.type = NAT_EVENT_TIMEOUT,
+                           .timeout.deadline = event.timeout.deadline};
     default:
       break;
     }
   }
 }
 
-static nat_event_t poll_natpmp(nat_session_t *session, uint64_t now) {
+static nat_event_t poll_natpmp(nat_session_t *session, pcp_time_ms_t now) {
   for (;;) {
     natpmp_event_t const event = natpmp_session_poll(session->natpmp, now);
     nat_mapping_t *mapping;
@@ -298,13 +294,13 @@ static nat_event_t poll_natpmp(nat_session_t *session, uint64_t now) {
   }
 }
 
-nat_event_t nat_session_poll(nat_session_t *session, uint64_t now) {
+nat_event_t nat_session_poll(nat_session_t *session, pcp_time_ms_t now) {
   return session->pcp != nullptr ? poll_pcp(session, now)
                                  : poll_natpmp(session, now);
 }
 
 void nat_session_on_datagram(nat_session_t *session,
-                             uint64_t now,
+                             pcp_time_ms_t now,
                              size_t size,
                              uint8_t const data[]) {
   if (session->pcp != nullptr) {
