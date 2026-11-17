@@ -24,7 +24,7 @@ typedef struct nat_config {
 } nat_config_t;
 
 // The largest datagram either protocol sends or receives
-#define NAT_PACKET_MAX_SIZE 1100
+static constexpr size_t NAT_PACKET_MAX_SIZE = 1100;
 
 typedef struct nat_session nat_session_t;
 

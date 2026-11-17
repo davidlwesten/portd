@@ -15,8 +15,8 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#define SERVER_PORT 5351
-#define ANNOUNCE_PORT 5350
+static constexpr uint16_t SERVER_PORT = 5351;
+static constexpr uint16_t ANNOUNCE_PORT = 5350;
 
 typedef struct mapping {
   // CLOCK_MONOTONIC milliseconds, 0 for a free slot
