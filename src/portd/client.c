@@ -3,9 +3,12 @@
 #include "errors.h"
 
 #include <arpa/inet.h>
+#include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/random.h>
@@ -15,9 +18,14 @@
 #define SERVER_PORT 5351
 #define ANNOUNCE_PORT 5350
 
-// Until mappings can be requested over D-Bus
-#define TEST_PORT 12345
-#define TEST_LIFETIME 120
+typedef struct mapping {
+  // CLOCK_MONOTONIC milliseconds, 0 for a free slot
+  uint64_t expires;
+  nat_protocol_t protocol;
+  uint16_t port;
+  // 0 while it isn't requested from a gateway
+  nat_handle_t handle;
+} mapping_t;
 
 static bool fill_random(void * /*ctx*/, size_t size, uint8_t data[]) {
   return getrandom(data, size, 0) == (ssize_t)size;
@@ -29,12 +37,57 @@ static uint64_t now_ms(client_t const *client) {
   return usec / 1000;
 }
 
-// Called once the session has nothing more to do before `deadline`
-static void wait_for(client_t *client, bool has_deadline, uint64_t deadline) {
-  if (client->stopping && !has_deadline) {
-    sd_event_exit(client->event, 0);
+static char const *protocol_name(nat_protocol_t protocol) {
+  switch (protocol) {
+  case NAT_PROTOCOL_TCP:
+    return "tcp";
+  case NAT_PROTOCOL_UDP:
+    return "udp";
   }
+  unreachable();
+}
 
+static mapping_t *find_mapping(client_t *client, nat_handle_t handle) {
+  for (size_t i = 0; i < client->capacity; i++) {
+    mapping_t *mapping = &client->mappings[i];
+    if (mapping->expires != 0 && mapping->handle == handle) {
+      return mapping;
+    }
+  }
+  return nullptr;
+}
+
+[[nodiscard]] static int
+request(client_t *client, mapping_t *mapping, uint32_t lifetime) {
+  nat_handle_or_error_t const handle = nat_session_map_request(
+      client->nat, lifetime, mapping->protocol, mapping->port, 0);
+  if (!handle.has_value) {
+    return -handle.error;
+  }
+  mapping->handle = handle.value;
+  return 0;
+}
+
+// Frees the slot, releasing the mapping on the gateway if it was requested
+static void release(client_t *client, mapping_t *mapping) {
+  if (mapping->handle != 0) {
+    nat_session_release(client->nat, mapping->handle);
+  }
+  *mapping = (mapping_t){};
+}
+
+static void expire(client_t *client, uint64_t now) {
+  for (size_t i = 0; i < client->capacity; i++) {
+    mapping_t *mapping = &client->mappings[i];
+    if (mapping->expires != 0 && mapping->expires <= now) {
+      fprintf(stderr, "portd: %s/%u expired\n",
+              protocol_name(mapping->protocol), (unsigned)mapping->port);
+      release(client, mapping);
+    }
+  }
+}
+
+static void wait_until(client_t *client, bool has_deadline, uint64_t deadline) {
   int r = 0;
   if (has_deadline) {
     r = sd_event_source_set_time(client->timer, deadline * 1000);
@@ -45,60 +98,94 @@ static void wait_for(client_t *client, bool has_deadline, uint64_t deadline) {
     r = sd_event_source_set_enabled(client->timer, SD_EVENT_OFF);
   }
   if (r < 0) {
-    fprintf(stderr, "portd: scheduling the session: %s\n", strerror(-r));
+    fprintf(stderr, "portd: scheduling the timer: %s\n", strerror(-r));
   }
 }
 
-static void log_mapped(nat_event_t const *event) {
-  char external[PCP_SOCKET_ADDRESS_STRING_LENGTH];
-  pcp_socket_address_to_string(sizeof(external), external,
-                               &event->mapped.external);
-  fprintf(stderr, "portd: mapping %u reachable at %s\n",
-          (unsigned)event->mapped.handle, external);
+static void on_event(client_t *client, nat_event_t const *event) {
+  mapping_t *mapping;
+  switch (event->type) {
+  case NAT_EVENT_PROTOCOL:
+    fprintf(stderr, "portd: the gateway doesn't speak PCP, trying NAT-PMP\n");
+    break;
+  case NAT_EVENT_ADDRESS: {
+    char address[PCP_IP_ADDRESS_STRING_LENGTH];
+    pcp_ip_address_to_string(sizeof(address), address,
+                             &event->address.external);
+    fprintf(stderr, "portd: external address %s\n", address);
+    break;
+  }
+  case NAT_EVENT_MAPPED: {
+    mapping = find_mapping(client, event->mapped.handle);
+    char external[PCP_SOCKET_ADDRESS_STRING_LENGTH];
+    pcp_socket_address_to_string(sizeof(external), external,
+                                 &event->mapped.external);
+    fprintf(stderr, "portd: %s/%u reachable at %s\n",
+            protocol_name(mapping->protocol), (unsigned)mapping->port,
+            external);
+    break;
+  }
+  case NAT_EVENT_UNMAPPED:
+    mapping = find_mapping(client, event->unmapped.handle);
+    fprintf(stderr, "portd: %s/%u lost, requesting it again\n",
+            protocol_name(mapping->protocol), (unsigned)mapping->port);
+    break;
+  case NAT_EVENT_FAILED:
+    mapping = find_mapping(client, event->failed.handle);
+    fprintf(stderr, "portd: %s/%u failed with result %u\n",
+            protocol_name(mapping->protocol), (unsigned)mapping->port,
+            (unsigned)event->failed.result);
+    *mapping = (mapping_t){};
+    break;
+  default:
+    break;
+  }
+}
+
+// Polls the session, returning when it next needs to be polled
+static void poll_session(client_t *client,
+                         uint64_t now,
+                         bool *has_deadline,
+                         uint64_t *deadline) {
+  int const fd = sd_event_source_get_io_fd(client->socket);
+  for (;;) {
+    nat_event_t const event = nat_session_poll(client->nat, now);
+    if (event.type == NAT_EVENT_TIMEOUT) {
+      *has_deadline = event.timeout.deadline.has_value;
+      *deadline = event.timeout.deadline.value;
+      return;
+    }
+    if (event.type == NAT_EVENT_SEND) {
+      // A lost request is retransmitted anyway
+      send(fd, event.send.data, event.send.size, 0);
+    } else {
+      on_event(client, &event);
+    }
+  }
 }
 
 static void run(client_t *client) {
-  if (client->nat == nullptr) {
+  uint64_t const now = now_ms(client);
+  expire(client, now);
+
+  bool has_deadline = false;
+  uint64_t deadline = 0;
+  if (client->nat != nullptr) {
+    poll_session(client, now, &has_deadline, &deadline);
+  }
+  if (client->stopping && !has_deadline) {
+    sd_event_exit(client->event, 0);
     return;
   }
-  int const fd = sd_event_source_get_io_fd(client->socket);
-  uint64_t const now = now_ms(client);
-  for (;;) {
-    nat_event_t const event = nat_session_poll(client->nat, now);
-    switch (event.type) {
-    case NAT_EVENT_SEND:
-      // A lost request is retransmitted anyway
-      send(fd, event.send.data, event.send.size, 0);
-      break;
-    case NAT_EVENT_PROTOCOL:
-      fprintf(stderr, "portd: the gateway doesn't speak PCP, trying NAT-PMP\n");
-      break;
-    case NAT_EVENT_ADDRESS: {
-      char address[PCP_IP_ADDRESS_STRING_LENGTH];
-      pcp_ip_address_to_string(sizeof(address), address,
-                               &event.address.external);
-      fprintf(stderr, "portd: external address %s\n", address);
-      break;
-    }
-    case NAT_EVENT_MAPPED:
-      log_mapped(&event);
-      break;
-    case NAT_EVENT_UNMAPPED:
-      fprintf(stderr, "portd: mapping %u lost\n",
-              (unsigned)event.unmapped.handle);
-      break;
-    case NAT_EVENT_FAILED:
-      fprintf(stderr, "portd: mapping %u refused with result %u\n",
-              (unsigned)event.failed.handle, (unsigned)event.failed.result);
-      break;
-    case NAT_EVENT_TIMEOUT:
-      wait_for(client, event.timeout.deadline.has_value,
-               event.timeout.deadline.value);
-      return;
-    default:
-      break;
+
+  for (size_t i = 0; i < client->capacity; i++) {
+    uint64_t const expires = client->mappings[i].expires;
+    if (expires != 0 && (!has_deadline || expires < deadline)) {
+      has_deadline = true;
+      deadline = expires;
     }
   }
+  wait_until(client, has_deadline, deadline);
 }
 
 static int on_datagram(sd_event_source * /*source*/,
@@ -226,6 +313,93 @@ on_timer(sd_event_source * /*source*/, uint64_t /*usec*/, void *userdata) {
   return connect_to_server(fd, gateway);
 }
 
+static void client_disconnect(client_t *client) {
+  if (client->nat != nullptr) {
+    nat_session_end(client->nat);
+    client->nat = nullptr;
+  }
+  for (size_t i = 0; i < client->capacity; i++) {
+    client->mappings[i].handle = 0;
+  }
+  client->socket = sd_event_source_disable_unref(client->socket);
+  client->announcements = sd_event_source_disable_unref(client->announcements);
+}
+
+int client_begin(client_t *client, sd_event *event, uint16_t capacity) {
+  assert(capacity > 0);
+  *client = (client_t){.event = event, .capacity = capacity};
+  client->mappings = calloc(capacity, sizeof(client->mappings[0]));
+  if (client->mappings == nullptr) {
+    return -ENOMEM;
+  }
+  int r = sd_event_add_time(event, &client->timer, CLOCK_MONOTONIC, 0, 0,
+                            on_timer, client);
+  if (r >= 0) {
+    r = sd_event_source_set_enabled(client->timer, SD_EVENT_OFF);
+  }
+  if (r < 0) {
+    client_end(client);
+    return r;
+  }
+  return 0;
+}
+
+void client_end(client_t *client) {
+  client_disconnect(client);
+  client->timer = sd_event_source_disable_unref(client->timer);
+  free(client->mappings);
+  client->mappings = nullptr;
+}
+
+int client_map(client_t *client,
+               nat_protocol_t protocol,
+               uint16_t port,
+               uint32_t lifetime) {
+  assert(lifetime > 0);
+  for (size_t i = 0; i < client->capacity; i++) {
+    mapping_t *mapping = &client->mappings[i];
+    if (mapping->expires != 0) {
+      continue;
+    }
+
+    *mapping = (mapping_t){
+        .expires = now_ms(client) + (uint64_t)lifetime * 1000,
+        .protocol = protocol,
+        .port = port,
+    };
+    if (client->nat != nullptr) {
+      int const r = request(client, mapping, lifetime);
+      if (r < 0) {
+        *mapping = (mapping_t){};
+        return r;
+      }
+    }
+    run(client);
+    return 0;
+  }
+  return -ENOBUFS;
+}
+
+// Asks the new gateway for every mapping, for the time each has left
+static void request_all(client_t *client) {
+  uint64_t const now = now_ms(client);
+  for (size_t i = 0; i < client->capacity; i++) {
+    mapping_t *mapping = &client->mappings[i];
+    if (mapping->expires == 0 || mapping->expires <= now) {
+      continue;
+    }
+    uint64_t const left = (mapping->expires - now + 999) / 1000;
+    int const r = request(client, mapping,
+                          left < UINT32_MAX ? (uint32_t)left : UINT32_MAX);
+    if (r < 0) {
+      fprintf(stderr, "portd: requesting %s/%u: %s\n",
+              protocol_name(mapping->protocol), (unsigned)mapping->port,
+              strerror(-r));
+      *mapping = (mapping_t){};
+    }
+  }
+}
+
 int client_connect(client_t *client, gateway_t const *gateway) {
   client_disconnect(client);
   if (client->stopping) {
@@ -250,30 +424,17 @@ int client_connect(client_t *client, gateway_t const *gateway) {
     client->announcements =
         sd_event_source_disable_unref(client->announcements);
   }
-  r = sd_event_add_time(client->event, &client->timer, CLOCK_MONOTONIC, 0, 0,
-                        on_timer, client);
-  if (r < 0) {
-    client_disconnect(client);
-    return r;
-  }
 
   client->nat = nat_session_begin((nat_config_t){
       .local = pcp_ip_address_from_in_addr(&local.sin_addr),
       .rng = {.fill = fill_random},
-      .capacity = 1,
+      .capacity = client->capacity,
   });
   if (client->nat == nullptr) {
     client_disconnect(client);
     return -ENOMEM;
   }
-  nat_handle_or_error_t const handle = nat_session_map_request(
-      client->nat, TEST_LIFETIME, NAT_PROTOCOL_UDP, TEST_PORT, 0);
-  if (!handle.has_value) {
-    client_disconnect(client);
-    return -handle.error;
-  }
-  client->mapping = handle.value;
-
+  request_all(client);
   run(client);
   return 0;
 }
@@ -284,16 +445,10 @@ void client_stop(client_t *client) {
     return;
   }
   client->stopping = true;
-  nat_session_release(client->nat, client->mapping);
-  run(client);
-}
-
-void client_disconnect(client_t *client) {
-  if (client->nat != nullptr) {
-    nat_session_end(client->nat);
-    client->nat = nullptr;
+  for (size_t i = 0; i < client->capacity; i++) {
+    if (client->mappings[i].expires != 0) {
+      release(client, &client->mappings[i]);
+    }
   }
-  client->socket = sd_event_source_disable_unref(client->socket);
-  client->announcements = sd_event_source_disable_unref(client->announcements);
-  client->timer = sd_event_source_disable_unref(client->timer);
+  run(client);
 }
