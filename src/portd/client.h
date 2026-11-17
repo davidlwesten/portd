@@ -2,11 +2,10 @@
 
 #include <stdint.h>
 
-#include <byo/natpmp/natpmp.h>
-#include <byo/pcp/pcp.h>
 #include <systemd/sd-event.h>
 
 #include "gateway.h"
+#include "nat.h"
 
 typedef struct client {
   sd_event *event;
@@ -15,16 +14,10 @@ typedef struct client {
   // Owns the socket for the gateway's announcements, if it could be opened
   sd_event_source *announcements;
   sd_event_source *timer;
-  // At most one of the sessions, PCP first, and neither while there's no
-  // gateway
-  pcp_session_t *pcp;
-  natpmp_session_t *natpmp;
-  union {
-    pcp_handle_t pcp;
-    natpmp_handle_t natpmp;
-  } mapping;
+  // Null while there's no gateway
+  nat_session_t *nat;
+  nat_handle_t mapping;
   bool stopping;
-  uint8_t buffer[PCP_PACKET_MAX_SIZE];
 } client_t;
 
 // Talks to `gateway` from now on, or to nothing if it has no ifindex

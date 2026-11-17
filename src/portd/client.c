@@ -49,135 +49,55 @@ static void wait_for(client_t *client, bool has_deadline, uint64_t deadline) {
   }
 }
 
-[[nodiscard]] static int request_test_mapping(client_t *client) {
-  if (client->pcp != nullptr) {
-    pcp_handle_or_error_t const handle = pcp_session_map_request(
-        client->pcp, TEST_LIFETIME, PCP_PROTOCOL_UDP, TEST_PORT,
-        (pcp_socket_address_t){.ip = pcp_ip_address_any_v4}, 0, nullptr);
-    if (!handle.has_value) {
-      return -handle.error;
-    }
-    client->mapping.pcp = handle.value;
-    return 0;
-  }
-
-  natpmp_handle_or_error_t const handle = natpmp_session_map_request(
-      client->natpmp, TEST_LIFETIME, NATPMP_PROTOCOL_UDP, TEST_PORT, 0);
-  if (!handle.has_value) {
-    return -handle.error;
-  }
-  client->mapping.natpmp = handle.value;
-  return 0;
-}
-
-static void run_natpmp(client_t *client) {
-  int const fd = sd_event_source_get_io_fd(client->socket);
-  uint64_t const now = now_ms(client);
-  for (;;) {
-    natpmp_event_t const event = natpmp_session_poll(client->natpmp, now);
-    switch (event.type) {
-    case NATPMP_EVENT_SEND:
-      send(fd, event.send.data, event.send.size, 0);
-      break;
-    case NATPMP_EVENT_ADDRESS: {
-      char address[INET_ADDRSTRLEN];
-      inet_ntop(AF_INET, event.address.external_ip.octets, address,
-                sizeof(address));
-      fprintf(stderr, "portd: external address %s\n", address);
-      break;
-    }
-    case NATPMP_EVENT_ADDRESS_FAILED:
-      fprintf(stderr, "portd: external address unknown, result %u\n",
-              (unsigned)event.address_failed.result);
-      break;
-    case NATPMP_EVENT_MAPPED:
-      fprintf(
-          stderr, "portd: mapping %u reachable on external port %u for %us\n",
-          (unsigned)event.mapped.handle, (unsigned)event.mapped.external_port,
-          (unsigned)event.mapped.lifetime);
-      break;
-    case NATPMP_EVENT_MAP_FAILED:
-      fprintf(stderr, "portd: mapping %u refused with result %u\n",
-              (unsigned)event.map_failed.handle,
-              (unsigned)event.map_failed.result);
-      break;
-    case NATPMP_EVENT_TIMEOUT:
-      wait_for(client, event.timeout.deadline.has_value,
-               event.timeout.deadline.value);
-      return;
-    default:
-      break;
-    }
-  }
-}
-
-static void fall_back_to_natpmp(client_t *client) {
-  fprintf(stderr, "portd: the gateway doesn't speak PCP, trying NAT-PMP\n");
-  pcp_session_end(client->pcp);
-  client->pcp = nullptr;
-
-  client->natpmp =
-      natpmp_session_begin((natpmp_config_t){.rng = {.fill = fill_random}});
-  if (client->natpmp == nullptr) {
-    fprintf(stderr, "portd: starting the NAT-PMP session: %s\n",
-            strerror(ENOMEM));
-    client_disconnect(client);
-    return;
-  }
-  natpmp_session_address_request(client->natpmp);
-  int const r = request_test_mapping(client);
-  if (r < 0) {
-    fprintf(stderr, "portd: requesting the mapping: %s\n", strerror(-r));
-  }
-  run_natpmp(client);
-}
-
-static void run_pcp(client_t *client) {
-  int const fd = sd_event_source_get_io_fd(client->socket);
-  uint64_t const now = now_ms(client);
-  for (;;) {
-    pcp_event_t const event = pcp_session_poll(client->pcp, now);
-    switch (event.type) {
-    case PCP_EVENT_SEND:
-      // A lost request is retransmitted anyway
-      send(fd, event.send.data, event.send.size, 0);
-      break;
-    case PCP_EVENT_MAPPED: {
-      char external[PCP_SOCKET_ADDRESS_STRING_LENGTH];
-      pcp_socket_address_to_string(sizeof(external), external,
-                                   &event.mapped.external);
-      fprintf(stderr, "portd: mapping %u reachable at %s\n",
-              (unsigned)event.mapped.handle, external);
-      break;
-    }
-    case PCP_EVENT_UNMAPPED:
-      fprintf(stderr, "portd: mapping %u lost\n",
-              (unsigned)event.unmapped.handle);
-      break;
-    case PCP_EVENT_FAILED:
-      if (event.failed.result == PCP_RESULT_UNSUPP_VERSION &&
-          !client->stopping) {
-        fall_back_to_natpmp(client);
-        return;
-      }
-      fprintf(stderr, "portd: mapping %u refused with result %u\n",
-              (unsigned)event.failed.handle, (unsigned)event.failed.result);
-      break;
-    case PCP_EVENT_TIMEOUT:
-      wait_for(client, event.timeout.deadline.has_value,
-               event.timeout.deadline.value);
-      return;
-    default:
-      break;
-    }
-  }
+static void log_mapped(nat_event_t const *event) {
+  char external[PCP_SOCKET_ADDRESS_STRING_LENGTH];
+  pcp_socket_address_to_string(sizeof(external), external,
+                               &event->mapped.external);
+  fprintf(stderr, "portd: mapping %u reachable at %s\n",
+          (unsigned)event->mapped.handle, external);
 }
 
 static void run(client_t *client) {
-  if (client->pcp != nullptr) {
-    run_pcp(client);
-  } else if (client->natpmp != nullptr) {
-    run_natpmp(client);
+  if (client->nat == nullptr) {
+    return;
+  }
+  int const fd = sd_event_source_get_io_fd(client->socket);
+  uint64_t const now = now_ms(client);
+  for (;;) {
+    nat_event_t const event = nat_session_poll(client->nat, now);
+    switch (event.type) {
+    case NAT_EVENT_SEND:
+      // A lost request is retransmitted anyway
+      send(fd, event.send.data, event.send.size, 0);
+      break;
+    case NAT_EVENT_PROTOCOL:
+      fprintf(stderr, "portd: the gateway doesn't speak PCP, trying NAT-PMP\n");
+      break;
+    case NAT_EVENT_ADDRESS: {
+      char address[PCP_IP_ADDRESS_STRING_LENGTH];
+      pcp_ip_address_to_string(sizeof(address), address,
+                               &event.address.external);
+      fprintf(stderr, "portd: external address %s\n", address);
+      break;
+    }
+    case NAT_EVENT_MAPPED:
+      log_mapped(&event);
+      break;
+    case NAT_EVENT_UNMAPPED:
+      fprintf(stderr, "portd: mapping %u lost\n",
+              (unsigned)event.unmapped.handle);
+      break;
+    case NAT_EVENT_FAILED:
+      fprintf(stderr, "portd: mapping %u refused with result %u\n",
+              (unsigned)event.failed.handle, (unsigned)event.failed.result);
+      break;
+    case NAT_EVENT_TIMEOUT:
+      wait_for(client, event.timeout.deadline.has_value,
+               event.timeout.deadline.value);
+      return;
+    default:
+      break;
+    }
   }
 }
 
@@ -188,17 +108,16 @@ static int on_datagram(sd_event_source * /*source*/,
   client_t *client = userdata;
 
   uint64_t const now = now_ms(client);
-  uint8_t buffer[PCP_PACKET_MAX_SIZE];
+  uint8_t buffer[NAT_PACKET_MAX_SIZE];
   for (;;) {
     ssize_t const size = recv(fd, buffer, sizeof(buffer), 0);
-    if (size >= 0 && client->pcp != nullptr) {
-      pcp_session_on_datagram(client->pcp, now, (size_t)size, buffer);
-    } else if (size >= 0) {
-      natpmp_session_on_datagram(client->natpmp, now, (size_t)size, buffer);
-    } else if (errno == ECONNREFUSED && client->natpmp != nullptr) {
-      natpmp_session_on_host_unreachable(client->natpmp);
+    if (size >= 0) {
+      nat_session_on_datagram(client->nat, now, (size_t)size, buffer);
     } else if (errno == ECONNREFUSED) {
-      fprintf(stderr, "portd: the gateway refused PCP\n");
+      if (nat_session_protocol(client->nat) == NAT_GATEWAY_PROTOCOL_PCP) {
+        fprintf(stderr, "portd: the gateway refused PCP\n");
+      }
+      nat_session_on_host_unreachable(client->nat);
     } else {
       if (errno != EAGAIN) {
         fprintf(stderr, "portd: receiving from the gateway: %s\n",
@@ -338,48 +257,41 @@ int client_connect(client_t *client, gateway_t const *gateway) {
     return r;
   }
 
-  client->pcp = pcp_session_begin((pcp_config_t){
+  client->nat = nat_session_begin((nat_config_t){
       .local = pcp_ip_address_from_in_addr(&local.sin_addr),
       .rng = {.fill = fill_random},
-      .buffer = {.size = sizeof(client->buffer), .data = client->buffer},
+      .capacity = 1,
   });
-  if (client->pcp == nullptr) {
+  if (client->nat == nullptr) {
     client_disconnect(client);
     return -ENOMEM;
   }
-  r = request_test_mapping(client);
-  if (r < 0) {
+  nat_handle_or_error_t const handle = nat_session_map_request(
+      client->nat, TEST_LIFETIME, NAT_PROTOCOL_UDP, TEST_PORT, 0);
+  if (!handle.has_value) {
     client_disconnect(client);
-    return r;
+    return -handle.error;
   }
+  client->mapping = handle.value;
 
   run(client);
   return 0;
 }
 
 void client_stop(client_t *client) {
-  if (client->stopping ||
-      (client->pcp == nullptr && client->natpmp == nullptr)) {
+  if (client->stopping || client->nat == nullptr) {
     sd_event_exit(client->event, 0);
     return;
   }
   client->stopping = true;
-  if (client->pcp != nullptr) {
-    pcp_session_release(client->pcp, client->mapping.pcp);
-  } else {
-    natpmp_session_release(client->natpmp, client->mapping.natpmp);
-  }
+  nat_session_release(client->nat, client->mapping);
   run(client);
 }
 
 void client_disconnect(client_t *client) {
-  if (client->pcp != nullptr) {
-    pcp_session_end(client->pcp);
-    client->pcp = nullptr;
-  }
-  if (client->natpmp != nullptr) {
-    natpmp_session_end(client->natpmp);
-    client->natpmp = nullptr;
+  if (client->nat != nullptr) {
+    nat_session_end(client->nat);
+    client->nat = nullptr;
   }
   client->socket = sd_event_source_disable_unref(client->socket);
   client->announcements = sd_event_source_disable_unref(client->announcements);

@@ -30,4 +30,5 @@ find_package(PkgConfig REQUIRED)
 pkg_check_modules(libmnl REQUIRED IMPORTED_TARGET libmnl)
 pkg_check_modules(libsystemd REQUIRED IMPORTED_TARGET libsystemd>=253)
 
+add_subdirectory(lib)
 add_subdirectory(src/portd)
