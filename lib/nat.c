@@ -180,18 +180,10 @@ static void fall_back(nat_session_t *session) {
   }
 }
 
+// The session retries the short-lived failures (e.g. NO_RESOURCES) itself
 static nat_result_t from_pcp(pcp_result_t result) {
-  switch (result) {
-  case PCP_RESULT_NOT_AUTHORIZED:
-    return NAT_RESULT_NOT_AUTHORIZED;
-  case PCP_RESULT_NO_RESOURCES:
-  case PCP_RESULT_USER_EX_QUOTA:
-    return NAT_RESULT_NO_RESOURCES;
-  case PCP_RESULT_NETWORK_FAILURE:
-    return NAT_RESULT_NETWORK_FAILURE;
-  default:
-    return NAT_RESULT_OTHER;
-  }
+  return result == PCP_RESULT_NOT_AUTHORIZED ? NAT_RESULT_NOT_AUTHORIZED
+                                             : NAT_RESULT_OTHER;
 }
 
 static nat_result_t from_natpmp(natpmp_result_t result) {
