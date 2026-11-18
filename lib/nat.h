@@ -7,7 +7,8 @@
 
 // A port mapping session with one gateway, without any I/O like the PCP and
 // NAT-PMP sessions it wraps: PCP first, and NAT-PMP if the gateway only speaks
-// that. Handles stay the same when it falls back.
+// that. Mappings are known by ids the caller picks, which stay the same when it
+// falls back.
 
 typedef struct nat_config {
   // Our address as the gateway sees it
@@ -35,32 +36,25 @@ typedef enum nat_gateway_protocol {
 
 nat_gateway_protocol_t nat_session_protocol(nat_session_t const *session);
 
-typedef uint16_t nat_handle_t;
-
-typedef struct nat_handle_or_error {
-  bool has_value;
-  union {
-    nat_handle_t value;
-    // An errno value, e.g. ENOBUFS when the session is full
-    int error;
-  };
-} nat_handle_or_error_t;
-
 typedef enum nat_protocol {
   NAT_PROTOCOL_TCP = 6,
   NAT_PROTOCOL_UDP = 17,
 } nat_protocol_t;
 
-// `external_port` is the one to suggest, 0 for any. With PCP, the external
-// address suggested is the last one the gateway gave.
-nat_handle_or_error_t nat_session_map_request(nat_session_t *session,
-                                              uint32_t lifetime,
-                                              nat_protocol_t protocol,
-                                              uint16_t port,
-                                              uint16_t external_port);
+// `id` must not be in use by another mapping of the session. `external_port` is
+// the one to suggest, 0 for any. With PCP, the external address suggested is
+// the last one the gateway gave. Returns a negative errno value, e.g. -ENOBUFS
+// when the session is full.
+[[nodiscard]] int nat_session_map_request(nat_session_t *session,
+                                          uint64_t id,
+                                          uint32_t lifetime,
+                                          nat_protocol_t protocol,
+                                          uint16_t port,
+                                          uint16_t external_port);
 
-// The handle is invalid afterwards and no more events refer to it
-void nat_session_release(nat_session_t *session, nat_handle_t handle);
+// `id` must be mapped. No more events refer to it afterwards, so it can be
+// used again.
+void nat_session_release(nat_session_t *session, uint64_t id);
 
 typedef enum nat_result {
   NAT_RESULT_NOT_AUTHORIZED,
@@ -84,7 +78,7 @@ typedef struct nat_event {
     NAT_EVENT_MAPPED,
     // The mapping was lost and gets requested again
     NAT_EVENT_UNMAPPED,
-    // The last event for the handle
+    // The last event for the id
     NAT_EVENT_FAILED,
     NAT_EVENT_TIMEOUT,
   } type;
@@ -98,14 +92,14 @@ typedef struct nat_event {
       pcp_ip_address_t external;
     } address;
     struct {
-      nat_handle_t handle;
+      uint64_t id;
       pcp_socket_address_t external;
     } mapped;
     struct {
-      nat_handle_t handle;
+      uint64_t id;
     } unmapped;
     struct {
-      nat_handle_t handle;
+      uint64_t id;
       nat_result_t result;
     } failed;
     struct {

@@ -8,7 +8,7 @@
 #include <byo/pcp/pcp.h>
 
 typedef struct nat_mapping {
-  // 0 for a free slot
+  uint64_t id;
   uint32_t lifetime;
   nat_protocol_t protocol;
   uint16_t port;
@@ -19,6 +19,7 @@ typedef struct nat_mapping {
 
 struct nat_session {
   uint16_t capacity;
+  uint16_t count;
   // Null once the session fell back to NAT-PMP
   pcp_session_t *pcp;
   // Created along with the PCP session, so falling back can't fail
@@ -71,28 +72,28 @@ nat_gateway_protocol_t nat_session_protocol(nat_session_t const *session) {
                                  : NAT_GATEWAY_PROTOCOL_NATPMP;
 }
 
-static nat_handle_t handle_of(nat_session_t const *session,
-                              nat_mapping_t const *mapping) {
-  return (nat_handle_t)(mapping - session->mappings + 1);
-}
-
-static nat_mapping_t *find_handle(nat_session_t *session, nat_handle_t handle) {
-  if (handle == 0 || handle > session->capacity) {
-    return nullptr;
+static nat_mapping_t *find_id(nat_session_t *session, uint64_t id) {
+  for (size_t i = 0; i < session->count; i++) {
+    if (session->mappings[i].id == id) {
+      return &session->mappings[i];
+    }
   }
-  nat_mapping_t *mapping = &session->mappings[handle - 1];
-  return mapping->lifetime != 0 ? mapping : nullptr;
+  return nullptr;
 }
 
 // The mapping with `handle` in the session in use
 static nat_mapping_t *find_inner(nat_session_t *session, uint16_t handle) {
-  for (size_t i = 0; i < session->capacity; i++) {
-    nat_mapping_t *mapping = &session->mappings[i];
-    if (mapping->lifetime != 0 && mapping->handle == handle) {
-      return mapping;
+  for (size_t i = 0; i < session->count; i++) {
+    if (session->mappings[i].handle == handle) {
+      return &session->mappings[i];
     }
   }
   return nullptr;
+}
+
+// Moves the last mapping into its place
+static void remove_mapping(nat_session_t *session, nat_mapping_t *mapping) {
+  *mapping = session->mappings[--session->count];
 }
 
 [[nodiscard]] static int request(nat_session_t *session,
@@ -121,46 +122,43 @@ static nat_mapping_t *find_inner(nat_session_t *session, uint16_t handle) {
   return 0;
 }
 
-nat_handle_or_error_t nat_session_map_request(nat_session_t *session,
-                                              uint32_t lifetime,
-                                              nat_protocol_t protocol,
-                                              uint16_t port,
-                                              uint16_t external_port) {
+int nat_session_map_request(nat_session_t *session,
+                            uint64_t id,
+                            uint32_t lifetime,
+                            nat_protocol_t protocol,
+                            uint16_t port,
+                            uint16_t external_port) {
   assert(lifetime > 0);
-  for (size_t i = 0; i < session->capacity; i++) {
-    nat_mapping_t *mapping = &session->mappings[i];
-    if (mapping->lifetime != 0) {
-      continue;
-    }
-
-    *mapping = (nat_mapping_t){
-        .lifetime = lifetime,
-        .protocol = protocol,
-        .port = port,
-        .external_port = external_port,
-    };
-    int const r = request(session, mapping);
-    if (r < 0) {
-      mapping->lifetime = 0;
-      return (nat_handle_or_error_t){.error = -r};
-    }
-    return (nat_handle_or_error_t){.has_value = true,
-                                   .value = handle_of(session, mapping)};
+  assert(find_id(session, id) == nullptr);
+  if (session->count == session->capacity) {
+    return -ENOBUFS;
   }
-  return (nat_handle_or_error_t){.error = ENOBUFS};
+
+  nat_mapping_t *mapping = &session->mappings[session->count];
+  *mapping = (nat_mapping_t){
+      .id = id,
+      .lifetime = lifetime,
+      .protocol = protocol,
+      .port = port,
+      .external_port = external_port,
+  };
+  int const r = request(session, mapping);
+  if (r < 0) {
+    return r;
+  }
+  session->count++;
+  return 0;
 }
 
-void nat_session_release(nat_session_t *session, nat_handle_t handle) {
-  nat_mapping_t *mapping = find_handle(session, handle);
-  if (mapping == nullptr) {
-    return;
-  }
+void nat_session_release(nat_session_t *session, uint64_t id) {
+  nat_mapping_t *mapping = find_id(session, id);
+  assert(mapping != nullptr);
   if (session->pcp != nullptr) {
     pcp_session_release(session->pcp, mapping->handle);
   } else {
     natpmp_session_release(session->natpmp, mapping->handle);
   }
-  mapping->lifetime = 0;
+  remove_mapping(session, mapping);
 }
 
 static void fall_back(nat_session_t *session) {
@@ -168,13 +166,10 @@ static void fall_back(nat_session_t *session) {
   session->pcp = nullptr;
 
   natpmp_session_address_request(session->natpmp);
-  for (size_t i = 0; i < session->capacity; i++) {
-    nat_mapping_t *mapping = &session->mappings[i];
-    if (mapping->lifetime != 0) {
-      // The NAT-PMP session is as large as this one and holds nothing yet
-      [[maybe_unused]] int const r = request(session, mapping);
-      assert(r == 0);
-    }
+  for (size_t i = 0; i < session->count; i++) {
+    // The NAT-PMP session is as large as this one and holds nothing yet
+    [[maybe_unused]] int const r = request(session, &session->mappings[i]);
+    assert(r == 0);
   }
 }
 
@@ -212,17 +207,16 @@ static nat_event_t poll_pcp(nat_session_t *session, pcp_time_ms_t now) {
       mapping = find_inner(session, event.mapped.handle);
       if (mapping != nullptr) {
         session->external = event.mapped.external.ip;
-        return (nat_event_t){.type = NAT_EVENT_MAPPED,
-                             .mapped = {.handle = handle_of(session, mapping),
-                                        .external = event.mapped.external}};
+        return (nat_event_t){
+            .type = NAT_EVENT_MAPPED,
+            .mapped = {.id = mapping->id, .external = event.mapped.external}};
       }
       break;
     case PCP_EVENT_UNMAPPED:
       mapping = find_inner(session, event.unmapped.handle);
       if (mapping != nullptr) {
-        return (nat_event_t){
-            .type = NAT_EVENT_UNMAPPED,
-            .unmapped = {.handle = handle_of(session, mapping)}};
+        return (nat_event_t){.type = NAT_EVENT_UNMAPPED,
+                             .unmapped = {.id = mapping->id}};
       }
       break;
     case PCP_EVENT_FAILED:
@@ -234,10 +228,12 @@ static nat_event_t poll_pcp(nat_session_t *session, pcp_time_ms_t now) {
         fall_back(session);
         return (nat_event_t){.type = NAT_EVENT_PROTOCOL};
       }
-      mapping->lifetime = 0;
-      return (nat_event_t){.type = NAT_EVENT_FAILED,
-                           .failed = {.handle = handle_of(session, mapping),
-                                      .result = from_pcp(event.failed.result)}};
+      nat_event_t const failed = {
+          .type = NAT_EVENT_FAILED,
+          .failed = {.id = mapping->id,
+                     .result = from_pcp(event.failed.result)}};
+      remove_mapping(session, mapping);
+      return failed;
     case PCP_EVENT_TIMEOUT:
       return (nat_event_t){.type = NAT_EVENT_TIMEOUT,
                            .timeout.deadline = event.timeout.deadline};
@@ -268,7 +264,7 @@ static nat_event_t poll_natpmp(nat_session_t *session, pcp_time_ms_t now) {
       if (mapping != nullptr) {
         return (nat_event_t){
             .type = NAT_EVENT_MAPPED,
-            .mapped = {.handle = handle_of(session, mapping),
+            .mapped = {.id = mapping->id,
                        .external = {.ip = session->external,
                                     .port = event.mapped.external_port}}};
       }
@@ -276,11 +272,12 @@ static nat_event_t poll_natpmp(nat_session_t *session, pcp_time_ms_t now) {
     case NATPMP_EVENT_MAP_FAILED:
       mapping = find_inner(session, event.map_failed.handle);
       if (mapping != nullptr) {
-        mapping->lifetime = 0;
-        return (nat_event_t){
+        nat_event_t const failed = {
             .type = NAT_EVENT_FAILED,
-            .failed = {.handle = handle_of(session, mapping),
+            .failed = {.id = mapping->id,
                        .result = from_natpmp(event.map_failed.result)}};
+        remove_mapping(session, mapping);
+        return failed;
       }
       break;
     case NATPMP_EVENT_TIMEOUT:

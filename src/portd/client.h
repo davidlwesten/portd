@@ -19,6 +19,8 @@ typedef struct client {
   nat_session_t *nat;
   uint16_t capacity;
   struct mapping *mappings;
+  // For the next mapping, never reused
+  uint64_t next_id;
   bool stopping;
 } client_t;
 

@@ -50,11 +50,9 @@ static void expect_idle(void) {
   TEST_ASSERT_EQUAL(NAT_EVENT_TIMEOUT, poll_event().type);
 }
 
-static nat_handle_t map(nat_protocol_t protocol, uint16_t port) {
-  nat_handle_or_error_t const handle =
-      nat_session_map_request(session, 120, protocol, port, 0);
-  TEST_ASSERT_TRUE(handle.has_value);
-  return handle.value;
+static void map(uint64_t id, nat_protocol_t protocol, uint16_t port) {
+  TEST_ASSERT_EQUAL_INT(
+      0, nat_session_map_request(session, id, 120, protocol, port, 0));
 }
 
 static uint16_t read16(uint8_t const data[]) {
@@ -104,20 +102,20 @@ static void answer_natpmp_map(uint16_t result, uint16_t external_port) {
   nat_session_on_datagram(session, now, sizeof(response), response);
 }
 
-static void expect_mapped(nat_handle_t handle, uint16_t external_port) {
+static void expect_mapped(uint64_t id, uint16_t external_port) {
   nat_event_t const event = poll_event();
   TEST_ASSERT_EQUAL(NAT_EVENT_MAPPED, event.type);
-  TEST_ASSERT_EQUAL_UINT16(handle, event.mapped.handle);
+  TEST_ASSERT_EQUAL_UINT64(id, event.mapped.id);
   pcp_ip_address_t const external = pcp_ip_address_from_octets(203, 0, 113, 7);
   TEST_ASSERT_EQUAL_MEMORY(&external, &event.mapped.external.ip,
                            sizeof(external));
   TEST_ASSERT_EQUAL_UINT16(external_port, event.mapped.external.port);
 }
 
-static void expect_failed(nat_handle_t handle, nat_result_t result) {
+static void expect_failed(uint64_t id, nat_result_t result) {
   nat_event_t const event = poll_event();
   TEST_ASSERT_EQUAL(NAT_EVENT_FAILED, event.type);
-  TEST_ASSERT_EQUAL_UINT16(handle, event.failed.handle);
+  TEST_ASSERT_EQUAL_UINT64(id, event.failed.id);
   TEST_ASSERT_EQUAL(result, event.failed.result);
 }
 
@@ -139,83 +137,92 @@ static void fall_back(void) {
 }
 
 static void test_pcp_maps(void) {
-  nat_handle_t const handle = map(NAT_PROTOCOL_UDP, 12345);
+  map(7, NAT_PROTOCOL_UDP, 12345);
   expect_idle();
   TEST_ASSERT_EQUAL_UINT8(2, sent[0]);
   TEST_ASSERT_EQUAL_UINT16(12345, read16(&sent[40]));
 
   answer_pcp(0, 40345);
-  expect_mapped(handle, 40345);
+  expect_mapped(7, 40345);
   expect_idle();
   TEST_ASSERT_EQUAL(NAT_GATEWAY_PROTOCOL_PCP, nat_session_protocol(session));
 }
 
 static void test_pcp_suggests_the_last_address(void) {
-  map(NAT_PROTOCOL_UDP, 12345);
+  map(1, NAT_PROTOCOL_UDP, 12345);
   expect_idle();
   pcp_ip_address_t const any = pcp_ip_address_any_v4;
   TEST_ASSERT_EQUAL_MEMORY(&any, &sent[44], sizeof(any));
   answer_pcp(0, 40345);
   poll_event();
 
-  map(NAT_PROTOCOL_TCP, 8080);
+  map(2, NAT_PROTOCOL_TCP, 8080);
   expect_idle();
   pcp_ip_address_t const external = pcp_ip_address_from_octets(203, 0, 113, 7);
   TEST_ASSERT_EQUAL_MEMORY(&external, &sent[44], sizeof(external));
 }
 
 static void test_pcp_refusal_is_translated(void) {
-  nat_handle_t const handle = map(NAT_PROTOCOL_TCP, 8080);
+  map(7, NAT_PROTOCOL_TCP, 8080);
   expect_idle();
   answer_pcp(2, 0); // NOT_AUTHORIZED
-  expect_failed(handle, NAT_RESULT_NOT_AUTHORIZED);
+  expect_failed(7, NAT_RESULT_NOT_AUTHORIZED);
+  expect_idle();
+  TEST_ASSERT_EQUAL_INT(
+      0, nat_session_map_request(session, 7, 120, NAT_PROTOCOL_TCP, 8080, 0));
 }
 
-static void test_fall_back_keeps_handles(void) {
-  nat_handle_t const released = map(NAT_PROTOCOL_UDP, 1);
-  nat_handle_t const udp = map(NAT_PROTOCOL_UDP, 12345);
-  nat_handle_t const tcp = map(NAT_PROTOCOL_TCP, 8080);
-  // So the NAT-PMP session numbers the other two differently
-  nat_session_release(session, released);
+// Answers the NAT-PMP map request in `sent` for whichever of the two ports it
+// is, expecting the mapping's id back
+static void answer_either(uint64_t udp, uint64_t tcp) {
+  bool const is_udp = sent[1] == 1;
+  uint16_t const port = read16(&sent[4]);
+  TEST_ASSERT_EQUAL_UINT16(is_udp ? 12345 : 8080, port);
+  answer_natpmp_map(0, (uint16_t)(port + 28000));
+  expect_mapped(is_udp ? udp : tcp, (uint16_t)(port + 28000));
+}
+
+static void test_fall_back_keeps_ids(void) {
+  map(41, NAT_PROTOCOL_UDP, 1);
+  map(42, NAT_PROTOCOL_UDP, 12345);
+  map(43, NAT_PROTOCOL_TCP, 8080);
+  // Moves the last mapping into the first one's place
+  nat_session_release(session, 41);
   expect_idle();
   fall_back();
 
-  TEST_ASSERT_EQUAL_UINT8(1, sent[1]);
-  TEST_ASSERT_EQUAL_UINT16(12345, read16(&sent[4]));
-  answer_natpmp_map(0, 40345);
-  expect_mapped(udp, 40345);
-
+  uint8_t const first = sent[1];
+  answer_either(42, 43);
   expect_idle();
-  TEST_ASSERT_EQUAL_UINT8(2, sent[1]);
-  TEST_ASSERT_EQUAL_UINT16(8080, read16(&sent[4]));
-  answer_natpmp_map(0, 40080);
-  expect_mapped(tcp, 40080);
+  TEST_ASSERT_NOT_EQUAL_UINT8(first, sent[1]);
+  answer_either(42, 43);
+  expect_idle();
 }
 
 static void test_natpmp_refusal_is_translated(void) {
-  nat_handle_t const handle = map(NAT_PROTOCOL_UDP, 12345);
+  map(7, NAT_PROTOCOL_UDP, 12345);
   expect_idle();
   fall_back();
   answer_natpmp_map(2, 0); // NOT_AUTHORIZED
-  expect_failed(handle, NAT_RESULT_NOT_AUTHORIZED);
+  expect_failed(7, NAT_RESULT_NOT_AUTHORIZED);
 }
 
 static void test_natpmp_unreachable_fails(void) {
-  nat_handle_t const handle = map(NAT_PROTOCOL_UDP, 12345);
+  map(7, NAT_PROTOCOL_UDP, 12345);
   expect_idle();
   fall_back();
   nat_session_on_host_unreachable(session);
-  expect_failed(handle, NAT_RESULT_UNREACHABLE);
+  expect_failed(7, NAT_RESULT_UNREACHABLE);
 }
 
 static void test_release_deletes(void) {
-  nat_handle_t const handle = map(NAT_PROTOCOL_UDP, 12345);
+  map(7, NAT_PROTOCOL_UDP, 12345);
   expect_idle();
   answer_pcp(0, 40345);
-  expect_mapped(handle, 40345);
+  expect_mapped(7, 40345);
   expect_idle();
 
-  nat_session_release(session, handle);
+  nat_session_release(session, 7);
   nat_event_t event = poll_event();
   TEST_ASSERT_EQUAL(NAT_EVENT_TIMEOUT, event.type);
   uint8_t const no_lifetime[4] = {};
@@ -228,16 +235,14 @@ static void test_release_deletes(void) {
 }
 
 static void test_full_session_refuses(void) {
-  map(NAT_PROTOCOL_UDP, 1);
-  nat_handle_t const second = map(NAT_PROTOCOL_UDP, 2);
-  map(NAT_PROTOCOL_UDP, 3);
-  nat_handle_or_error_t const fourth =
-      nat_session_map_request(session, 120, NAT_PROTOCOL_UDP, 4, 0);
-  TEST_ASSERT_FALSE(fourth.has_value);
-  TEST_ASSERT_EQUAL_INT(ENOBUFS, fourth.error);
+  map(1, NAT_PROTOCOL_UDP, 1);
+  map(2, NAT_PROTOCOL_UDP, 2);
+  map(3, NAT_PROTOCOL_UDP, 3);
+  TEST_ASSERT_EQUAL_INT(-ENOBUFS, nat_session_map_request(
+                                      session, 4, 120, NAT_PROTOCOL_UDP, 4, 0));
 
-  nat_session_release(session, second);
-  TEST_ASSERT_EQUAL_UINT16(second, map(NAT_PROTOCOL_UDP, 4));
+  nat_session_release(session, 2);
+  map(4, NAT_PROTOCOL_UDP, 4);
 }
 
 // Runs the test named on the command line, or all of them
@@ -251,7 +256,7 @@ int main(int argc, char *argv[]) {
   RUN(test_pcp_maps);
   RUN(test_pcp_suggests_the_last_address);
   RUN(test_pcp_refusal_is_translated);
-  RUN(test_fall_back_keeps_handles);
+  RUN(test_fall_back_keeps_ids);
   RUN(test_natpmp_refusal_is_translated);
   RUN(test_natpmp_unreachable_fails);
   RUN(test_release_deletes);
