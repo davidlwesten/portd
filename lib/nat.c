@@ -18,8 +18,6 @@ typedef struct nat_mapping {
 } nat_mapping_t;
 
 struct nat_session {
-  uint16_t capacity;
-  uint16_t count;
   // Null once the session fell back to NAT-PMP
   pcp_session_t *pcp;
   // Created along with the PCP session, so falling back can't fail
@@ -27,6 +25,8 @@ struct nat_session {
   // The last one the gateway gave, 0.0.0.0 until known
   pcp_ip_address_t external;
   uint8_t buffer[PCP_PACKET_MAX_SIZE];
+  uint16_t capacity;
+  uint16_t count;
   nat_mapping_t mappings[];
 };
 
