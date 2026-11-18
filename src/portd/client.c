@@ -21,7 +21,7 @@ static constexpr uint16_t ANNOUNCE_PORT = 5350;
 // Requested from the gateway whenever there's one
 typedef struct mapping {
   uint64_t id;
-  // CLOCK_MONOTONIC milliseconds, 0 for a free slot
+  // CLOCK_MONOTONIC milliseconds
   uint64_t expires;
   nat_protocol_t protocol;
   uint16_t port;
@@ -48,13 +48,17 @@ static char const *protocol_name(nat_protocol_t protocol) {
 }
 
 static mapping_t *find_mapping(client_t *client, uint64_t id) {
-  for (size_t i = 0; i < client->capacity; i++) {
-    mapping_t *mapping = &client->mappings[i];
-    if (mapping->expires != 0 && mapping->id == id) {
-      return mapping;
+  for (size_t i = 0; i < client->count; i++) {
+    if (client->mappings[i].id == id) {
+      return &client->mappings[i];
     }
   }
   return nullptr;
+}
+
+// Moves the last mapping into its place
+static void remove_mapping(client_t *client, mapping_t *mapping) {
+  *mapping = client->mappings[--client->count];
 }
 
 [[nodiscard]] static int
@@ -63,22 +67,25 @@ request(client_t *client, mapping_t *mapping, uint32_t lifetime) {
                                  mapping->protocol, mapping->port, 0);
 }
 
-// Frees the slot, releasing the mapping on the gateway if there's one
+// Also releases the mapping on the gateway, if there's one
 static void release(client_t *client, mapping_t *mapping) {
   if (client->nat != nullptr) {
     nat_session_release(client->nat, mapping->id);
   }
-  *mapping = (mapping_t){};
+  remove_mapping(client, mapping);
 }
 
 static void expire(client_t *client, uint64_t now) {
-  for (size_t i = 0; i < client->capacity; i++) {
+  for (size_t i = 0; i < client->count;) {
     mapping_t *mapping = &client->mappings[i];
-    if (mapping->expires != 0 && mapping->expires <= now) {
-      fprintf(stderr, "portd: %s/%u expired\n",
-              protocol_name(mapping->protocol), (unsigned)mapping->port);
-      release(client, mapping);
+    if (mapping->expires > now) {
+      i++;
+      continue;
     }
+    fprintf(stderr, "portd: %s/%u expired\n", protocol_name(mapping->protocol),
+            (unsigned)mapping->port);
+    // Puts another mapping at `i`
+    release(client, mapping);
   }
 }
 
@@ -130,7 +137,7 @@ static void on_event(client_t *client, nat_event_t const *event) {
     fprintf(stderr, "portd: %s/%u failed with result %u\n",
             protocol_name(mapping->protocol), (unsigned)mapping->port,
             (unsigned)event->failed.result);
-    *mapping = (mapping_t){};
+    remove_mapping(client, mapping);
     break;
   default:
     break;
@@ -173,9 +180,9 @@ static void run(client_t *client) {
     return;
   }
 
-  for (size_t i = 0; i < client->capacity; i++) {
+  for (size_t i = 0; i < client->count; i++) {
     uint64_t const expires = client->mappings[i].expires;
-    if (expires != 0 && (!has_deadline || expires < deadline)) {
+    if (!has_deadline || expires < deadline) {
       has_deadline = true;
       deadline = expires;
     }
@@ -348,40 +355,34 @@ int client_map(client_t *client,
                uint16_t port,
                uint32_t lifetime) {
   assert(lifetime > 0);
-  for (size_t i = 0; i < client->capacity; i++) {
-    mapping_t *mapping = &client->mappings[i];
-    if (mapping->expires != 0) {
-      continue;
-    }
-
-    *mapping = (mapping_t){
-        .id = client->next_id++,
-        .expires = now_ms(client) + (uint64_t)lifetime * 1000,
-        .protocol = protocol,
-        .port = port,
-    };
-    if (client->nat != nullptr) {
-      int const r = request(client, mapping, lifetime);
-      if (r < 0) {
-        *mapping = (mapping_t){};
-        return r;
-      }
-    }
-    run(client);
-    return 0;
+  if (client->count == client->capacity) {
+    return -ENOBUFS;
   }
-  return -ENOBUFS;
+
+  mapping_t *mapping = &client->mappings[client->count];
+  *mapping = (mapping_t){
+      .id = client->next_id++,
+      .expires = now_ms(client) + (uint64_t)lifetime * 1000,
+      .protocol = protocol,
+      .port = port,
+  };
+  if (client->nat != nullptr) {
+    int const r = request(client, mapping, lifetime);
+    if (r < 0) {
+      return r;
+    }
+  }
+  client->count++;
+  run(client);
+  return 0;
 }
 
 // Asks the new gateway for every mapping, for the time each has left. None
 // have expired yet.
 static void request_all(client_t *client) {
   uint64_t const now = now_ms(client);
-  for (size_t i = 0; i < client->capacity; i++) {
+  for (size_t i = 0; i < client->count;) {
     mapping_t *mapping = &client->mappings[i];
-    if (mapping->expires == 0) {
-      continue;
-    }
     uint64_t const left = (mapping->expires - now + 999) / 1000;
     int const r = request(client, mapping,
                           left < UINT32_MAX ? (uint32_t)left : UINT32_MAX);
@@ -389,7 +390,10 @@ static void request_all(client_t *client) {
       fprintf(stderr, "portd: requesting %s/%u: %s\n",
               protocol_name(mapping->protocol), (unsigned)mapping->port,
               strerror(-r));
-      *mapping = (mapping_t){};
+      // Puts another mapping at `i`
+      remove_mapping(client, mapping);
+    } else {
+      i++;
     }
   }
 }
@@ -441,10 +445,8 @@ void client_stop(client_t *client) {
     return;
   }
   client->stopping = true;
-  for (size_t i = 0; i < client->capacity; i++) {
-    if (client->mappings[i].expires != 0) {
-      release(client, &client->mappings[i]);
-    }
+  while (client->count > 0) {
+    release(client, &client->mappings[client->count - 1]);
   }
   run(client);
 }
