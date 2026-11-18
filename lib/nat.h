@@ -8,7 +8,7 @@
 // A port mapping session with one gateway, without any I/O like the PCP and
 // NAT-PMP sessions it wraps: PCP first, and NAT-PMP if the gateway only speaks
 // that. Mappings are known by ids the caller picks, which stay the same when it
-// falls back.
+// falls back. Functions that can fail return a negative errno value.
 
 typedef struct nat_config {
   // Our address as the gateway sees it
@@ -43,8 +43,7 @@ typedef enum nat_protocol {
 
 // `id` must not be in use by another mapping of the session. `external_port` is
 // the one to suggest, 0 for any. With PCP, the external address suggested is
-// the last one the gateway gave. Returns a negative errno value, e.g. -ENOBUFS
-// when the session is full.
+// the last one the gateway gave. Fails with -ENOBUFS when the session is full.
 [[nodiscard]] int nat_session_map_request(nat_session_t *session,
                                           uint64_t id,
                                           uint32_t lifetime,
