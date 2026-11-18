@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <stddef.h>
 #include <stdlib.h>
 
 #include <byo/natpmp/natpmp.h>
@@ -65,6 +66,16 @@ void nat_session_end(nat_session_t *session) {
     natpmp_session_end(session->natpmp);
   }
   free(session);
+}
+
+char const *nat_protocol_name(nat_protocol_t protocol) {
+  switch (protocol) {
+  case NAT_PROTOCOL_TCP:
+    return "tcp";
+  case NAT_PROTOCOL_UDP:
+    return "udp";
+  }
+  unreachable();
 }
 
 nat_gateway_protocol_t nat_session_protocol(nat_session_t const *session) {

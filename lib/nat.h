@@ -41,6 +41,9 @@ typedef enum nat_protocol {
   NAT_PROTOCOL_UDP = 17,
 } nat_protocol_t;
 
+// "tcp" or "udp"
+char const *nat_protocol_name(nat_protocol_t protocol);
+
 // `id` must not be in use by another mapping of the session. `external_port` is
 // the one to suggest, 0 for any. With PCP, the external address suggested is
 // the last one the gateway gave. Fails with -ENOBUFS when the session is full.

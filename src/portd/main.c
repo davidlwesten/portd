@@ -5,6 +5,7 @@
 
 #include <systemd/sd-event.h>
 
+#include "bus.h"
 #include "client.h"
 #include "gateway.h"
 
@@ -37,20 +38,22 @@ int main(void) {
   }
 
   client_t client;
-  r = client_begin(&client, event, CAPACITY);
+  bus_t bus;
+  r = bus_start(&bus, event, &client);
   if (r < 0) {
-    fprintf(stderr, "portd: starting the client: %s\n", strerror(-r));
+    fprintf(stderr, "portd: connecting to the system bus: %s\n", strerror(-r));
     sd_event_unref(event);
     return EXIT_FAILURE;
   }
-  // Until mappings can be requested over D-Bus
-  r = client_map(&client, NAT_PROTOCOL_UDP, 12345, 120);
-  if (r >= 0) {
-    r = client_map(&client, NAT_PROTOCOL_TCP, 8080, 200);
-  }
+  r = client_begin(&client, event, CAPACITY,
+                   (client_callbacks_t){
+                       .changed = bus_mapping_changed,
+                       .removed = bus_mapping_removed,
+                       .userdata = &bus,
+                   });
   if (r < 0) {
-    fprintf(stderr, "portd: mapping the test ports: %s\n", strerror(-r));
-    client_end(&client);
+    fprintf(stderr, "portd: starting the client: %s\n", strerror(-r));
+    bus_stop(&bus);
     sd_event_unref(event);
     return EXIT_FAILURE;
   }
@@ -63,6 +66,7 @@ int main(void) {
     if (r < 0) {
       fprintf(stderr, "portd: handling signals: %s\n", strerror(-r));
       client_end(&client);
+      bus_stop(&bus);
       sd_event_unref(event);
       return EXIT_FAILURE;
     }
@@ -73,12 +77,14 @@ int main(void) {
   if (r < 0) {
     fprintf(stderr, "portd: following route changes: %s\n", strerror(-r));
     client_end(&client);
+    bus_stop(&bus);
     sd_event_unref(event);
     return EXIT_FAILURE;
   }
 
   r = sd_event_loop(event);
   client_end(&client);
+  bus_stop(&bus);
   sd_event_unref(event);
   gateway_monitor_stop(&gateways);
   if (r < 0) {

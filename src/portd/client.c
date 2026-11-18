@@ -6,7 +6,6 @@
 #include <assert.h>
 #include <errno.h>
 #include <netinet/in.h>
-#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,15 +17,6 @@
 static constexpr uint16_t SERVER_PORT = 5351;
 static constexpr uint16_t ANNOUNCE_PORT = 5350;
 
-// Requested from the gateway whenever there's one
-typedef struct mapping {
-  uint64_t id;
-  // CLOCK_MONOTONIC milliseconds
-  uint64_t expires;
-  nat_protocol_t protocol;
-  uint16_t port;
-} mapping_t;
-
 static bool fill_random(void * /*ctx*/, size_t size, uint8_t data[]) {
   return getrandom(data, size, 0) == (ssize_t)size;
 }
@@ -37,17 +27,7 @@ static uint64_t now_ms(client_t const *client) {
   return usec / 1000;
 }
 
-static char const *protocol_name(nat_protocol_t protocol) {
-  switch (protocol) {
-  case NAT_PROTOCOL_TCP:
-    return "tcp";
-  case NAT_PROTOCOL_UDP:
-    return "udp";
-  }
-  unreachable();
-}
-
-static mapping_t *find_mapping(client_t *client, uint64_t id) {
+mapping_t const *client_find(client_t const *client, uint64_t id) {
   for (size_t i = 0; i < client->count; i++) {
     if (client->mappings[i].id == id) {
       return &client->mappings[i];
@@ -56,8 +36,37 @@ static mapping_t *find_mapping(client_t *client, uint64_t id) {
   return nullptr;
 }
 
-// Moves the last mapping into its place
-static void remove_mapping(client_t *client, mapping_t *mapping) {
+mapping_t const *client_find_port(client_t const *client,
+                                  nat_protocol_t protocol,
+                                  uint16_t port) {
+  for (size_t i = 0; i < client->count; i++) {
+    mapping_t const *mapping = &client->mappings[i];
+    if (mapping->protocol == protocol && mapping->port == port) {
+      return mapping;
+    }
+  }
+  return nullptr;
+}
+
+static mapping_t *find_mapping(client_t *client, uint64_t id) {
+  return (mapping_t *)client_find(client, id);
+}
+
+static void set_external_port(client_t *client,
+                              mapping_t *mapping,
+                              uint16_t external_port) {
+  if (mapping->external_port != external_port) {
+    mapping->external_port = external_port;
+    client->callbacks.changed(client->callbacks.userdata, mapping);
+  }
+}
+
+// Tells the callbacks while the mapping is still there, then moves the last
+// mapping into its place
+static void remove_mapping(client_t *client,
+                           mapping_t *mapping,
+                           nat_result_t const *failure) {
+  client->callbacks.removed(client->callbacks.userdata, mapping, failure);
   *mapping = client->mappings[--client->count];
 }
 
@@ -72,7 +81,7 @@ static void release(client_t *client, mapping_t *mapping) {
   if (client->nat != nullptr) {
     nat_session_release(client->nat, mapping->id);
   }
-  remove_mapping(client, mapping);
+  remove_mapping(client, mapping, nullptr);
 }
 
 static void expire(client_t *client, uint64_t now) {
@@ -82,8 +91,8 @@ static void expire(client_t *client, uint64_t now) {
       i++;
       continue;
     }
-    fprintf(stderr, "portd: %s/%u expired\n", protocol_name(mapping->protocol),
-            (unsigned)mapping->port);
+    fprintf(stderr, "portd: %s/%u expired\n",
+            nat_protocol_name(mapping->protocol), (unsigned)mapping->port);
     // Puts another mapping at `i`
     release(client, mapping);
   }
@@ -123,21 +132,23 @@ static void on_event(client_t *client, nat_event_t const *event) {
     pcp_socket_address_to_string(sizeof(external), external,
                                  &event->mapped.external);
     fprintf(stderr, "portd: %s/%u reachable at %s\n",
-            protocol_name(mapping->protocol), (unsigned)mapping->port,
+            nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
             external);
+    set_external_port(client, mapping, event->mapped.external.port);
     break;
   }
   case NAT_EVENT_UNMAPPED:
     mapping = find_mapping(client, event->unmapped.id);
     fprintf(stderr, "portd: %s/%u lost, requesting it again\n",
-            protocol_name(mapping->protocol), (unsigned)mapping->port);
+            nat_protocol_name(mapping->protocol), (unsigned)mapping->port);
+    set_external_port(client, mapping, 0);
     break;
   case NAT_EVENT_FAILED:
     mapping = find_mapping(client, event->failed.id);
     fprintf(stderr, "portd: %s/%u failed with result %u\n",
-            protocol_name(mapping->protocol), (unsigned)mapping->port,
+            nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
             (unsigned)event->failed.result);
-    remove_mapping(client, mapping);
+    remove_mapping(client, mapping, &event->failed.result);
     break;
   default:
     break;
@@ -320,13 +331,24 @@ static void client_disconnect(client_t *client) {
     nat_session_end(client->nat);
     client->nat = nullptr;
   }
+  for (size_t i = 0; i < client->count; i++) {
+    set_external_port(client, &client->mappings[i], 0);
+  }
   client->socket = sd_event_source_disable_unref(client->socket);
   client->announcements = sd_event_source_disable_unref(client->announcements);
 }
 
-int client_begin(client_t *client, sd_event *event, uint16_t capacity) {
+int client_begin(client_t *client,
+                 sd_event *event,
+                 uint16_t capacity,
+                 client_callbacks_t callbacks) {
   assert(capacity > 0);
-  *client = (client_t){.event = event, .capacity = capacity, .next_id = 1};
+  *client = (client_t){
+      .event = event,
+      .capacity = capacity,
+      .next_id = 1,
+      .callbacks = callbacks,
+  };
   client->mappings = calloc(capacity, sizeof(client->mappings[0]));
   if (client->mappings == nullptr) {
     return -ENOMEM;
@@ -350,19 +372,27 @@ void client_end(client_t *client) {
   client->mappings = nullptr;
 }
 
+static uint64_t expiry(client_t const *client, uint32_t lifetime) {
+  return now_ms(client) + (uint64_t)lifetime * 1000;
+}
+
 int client_map(client_t *client,
+               uid_t owner,
                nat_protocol_t protocol,
                uint16_t port,
-               uint32_t lifetime) {
+               uint32_t lifetime,
+               uint64_t *id) {
   assert(lifetime > 0);
+  assert(client_find_port(client, protocol, port) == nullptr);
   if (client->count == client->capacity) {
     return -ENOBUFS;
   }
 
   mapping_t *mapping = &client->mappings[client->count];
   *mapping = (mapping_t){
-      .id = client->next_id++,
-      .expires = now_ms(client) + (uint64_t)lifetime * 1000,
+      .id = client->next_id,
+      .expires = expiry(client, lifetime),
+      .owner = owner,
       .protocol = protocol,
       .port = port,
   };
@@ -373,8 +403,24 @@ int client_map(client_t *client,
     }
   }
   client->count++;
+  *id = client->next_id++;
   run(client);
   return 0;
+}
+
+void client_extend(client_t *client, uint64_t id, uint32_t lifetime) {
+  assert(lifetime > 0);
+  mapping_t *mapping = find_mapping(client, id);
+  assert(mapping != nullptr);
+  mapping->expires = expiry(client, lifetime);
+  run(client);
+}
+
+void client_release(client_t *client, uint64_t id) {
+  mapping_t *mapping = find_mapping(client, id);
+  assert(mapping != nullptr);
+  release(client, mapping);
+  run(client);
 }
 
 // Asks the new gateway for every mapping, for the time each has left. None
@@ -388,10 +434,11 @@ static void request_all(client_t *client) {
                           left < UINT32_MAX ? (uint32_t)left : UINT32_MAX);
     if (r < 0) {
       fprintf(stderr, "portd: requesting %s/%u: %s\n",
-              protocol_name(mapping->protocol), (unsigned)mapping->port,
+              nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
               strerror(-r));
+      nat_result_t const failure = NAT_RESULT_OTHER;
       // Puts another mapping at `i`
-      remove_mapping(client, mapping);
+      remove_mapping(client, mapping, &failure);
     } else {
       i++;
     }

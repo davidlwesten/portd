@@ -2,11 +2,11 @@
 
 A daemon that keeps port mappings open for this machine on its gateway. It
 follows the default gateway over netlink and speaks PCP, falling back to
-NAT-PMP when that's all the gateway supports. Applications will request
+NAT-PMP when that's all the gateway supports. Applications request
 mappings over D-Bus, and `portctl` will do the same from the command line.
 
-portd is in early development: the daemon maps a fixed test port, and the
-D-Bus interface and `portctl` are still to come.
+portd is in early development: the daemon serves mappings on the system bus,
+but there's no bus policy to install yet, and `portctl` is still to come.
 
 ## Building
 
