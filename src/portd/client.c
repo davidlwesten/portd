@@ -113,17 +113,26 @@ static void wait_until(client_t *client, bool has_deadline, uint64_t deadline) {
   }
 }
 
+static void set_external(client_t *client, pcp_ip_address_t const *external) {
+  if (memcmp(&client->external, external, sizeof(*external)) != 0) {
+    client->external = *external;
+    client->callbacks.gateway_changed(client->callbacks.userdata);
+  }
+}
+
 static void on_event(client_t *client, nat_event_t const *event) {
   mapping_t *mapping;
   switch (event->type) {
   case NAT_EVENT_PROTOCOL:
     fprintf(stderr, "portd: the gateway doesn't speak PCP, trying NAT-PMP\n");
+    client->callbacks.gateway_changed(client->callbacks.userdata);
     break;
   case NAT_EVENT_ADDRESS: {
     char address[PCP_IP_ADDRESS_STRING_LENGTH];
     pcp_ip_address_to_string(sizeof(address), address,
                              &event->address.external);
     fprintf(stderr, "portd: external address %s\n", address);
+    set_external(client, &event->address.external);
     break;
   }
   case NAT_EVENT_MAPPED: {
@@ -134,6 +143,11 @@ static void on_event(client_t *client, nat_event_t const *event) {
     fprintf(stderr, "portd: %s/%u reachable at %s\n",
             nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
             external);
+    // NAT-PMP's is 0.0.0.0 until the gateway gave it
+    if (memcmp(&event->mapped.external.ip, &pcp_ip_address_any_v4,
+               sizeof(pcp_ip_address_any_v4)) != 0) {
+      set_external(client, &event->mapped.external.ip);
+    }
     set_external_port(client, mapping, event->mapped.external.port);
     break;
   }
@@ -331,6 +345,8 @@ static void client_disconnect(client_t *client) {
     nat_session_end(client->nat);
     client->nat = nullptr;
   }
+  client->gateway = (gateway_t){};
+  client->external = pcp_ip_address_any_v4;
   for (size_t i = 0; i < client->count; i++) {
     set_external_port(client, &client->mappings[i], 0);
   }
@@ -346,6 +362,7 @@ int client_begin(client_t *client,
   *client = (client_t){
       .event = event,
       .capacity = capacity,
+      .external = pcp_ip_address_any_v4,
       .next_id = 1,
       .callbacks = callbacks,
   };
@@ -445,7 +462,8 @@ static void request_all(client_t *client) {
   }
 }
 
-int client_connect(client_t *client, gateway_t const *gateway) {
+[[nodiscard]] static int connect_gateway(client_t *client,
+                                         gateway_t const *gateway) {
   client_disconnect(client);
   // So the new gateway is only asked for live mappings
   expire(client, now_ms(client));
@@ -481,9 +499,16 @@ int client_connect(client_t *client, gateway_t const *gateway) {
     client_disconnect(client);
     return -ENOMEM;
   }
+  client->gateway = *gateway;
   request_all(client);
   run(client);
   return 0;
+}
+
+int client_connect(client_t *client, gateway_t const *gateway) {
+  int const r = connect_gateway(client, gateway);
+  client->callbacks.gateway_changed(client->callbacks.userdata);
+  return r;
 }
 
 void client_stop(client_t *client) {

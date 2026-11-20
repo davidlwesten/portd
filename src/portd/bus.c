@@ -1,5 +1,6 @@
 #include "bus.h"
 
+#include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
 #include <stddef.h>
@@ -244,6 +245,46 @@ static int enumerate_mappings(sd_bus * /*bus*/,
   return 0;
 }
 
+static char const *gateway_protocol_name(nat_gateway_protocol_t protocol) {
+  switch (protocol) {
+  case NAT_GATEWAY_PROTOCOL_PCP:
+    return "pcp";
+  case NAT_GATEWAY_PROTOCOL_NATPMP:
+    return "nat-pmp";
+  }
+  unreachable();
+}
+
+static int get_manager_property(sd_bus * /*bus*/,
+                                char const * /*path*/,
+                                char const * /*interface*/,
+                                char const *property,
+                                sd_bus_message *reply,
+                                void *userdata,
+                                sd_bus_error * /*error*/) {
+  client_t const *client = ((bus_t const *)userdata)->client;
+  if (strcmp(property, "Gateway") == 0) {
+    char address[INET_ADDRSTRLEN] = "";
+    if (client->gateway.ifindex != 0) {
+      inet_ntop(AF_INET, client->gateway.address, address, sizeof(address));
+    }
+    return sd_bus_message_append(reply, "s", address);
+  }
+  if (strcmp(property, "GatewayProtocol") == 0) {
+    return sd_bus_message_append(
+        reply, "s",
+        client->nat != nullptr
+            ? gateway_protocol_name(nat_session_protocol(client->nat))
+            : "");
+  }
+  char address[PCP_IP_ADDRESS_STRING_LENGTH] = "";
+  if (memcmp(&client->external, &pcp_ip_address_any_v4,
+             sizeof(pcp_ip_address_any_v4)) != 0) {
+    pcp_ip_address_to_string(sizeof(address), address, &client->external);
+  }
+  return sd_bus_message_append(reply, "s", address);
+}
+
 static sd_bus_vtable const manager_vtable[] = {
     SD_BUS_VTABLE_START(0),
     SD_BUS_METHOD_WITH_NAMES("Map",
@@ -254,6 +295,21 @@ static sd_bus_vtable const manager_vtable[] = {
                              SD_BUS_PARAM(mapping),
                              on_map,
                              SD_BUS_VTABLE_UNPRIVILEGED),
+    SD_BUS_PROPERTY("Gateway",
+                    "s",
+                    get_manager_property,
+                    0,
+                    SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_PROPERTY("GatewayProtocol",
+                    "s",
+                    get_manager_property,
+                    0,
+                    SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
+    SD_BUS_PROPERTY("ExternalAddress",
+                    "s",
+                    get_manager_property,
+                    0,
+                    SD_BUS_VTABLE_PROPERTY_EMITS_CHANGE),
     SD_BUS_VTABLE_END,
 };
 
@@ -371,5 +427,15 @@ void bus_mapping_removed(void *userdata,
   if (r < 0) {
     fprintf(stderr, "portd: announcing mapping %" PRIu64 ": %s\n", mapping->id,
             strerror(-r));
+  }
+}
+
+void bus_gateway_changed(void *userdata) {
+  bus_t const *bus = userdata;
+  int const r = sd_bus_emit_properties_changed(
+      bus->bus, PATH, MANAGER_INTERFACE, "Gateway", "GatewayProtocol",
+      "ExternalAddress", nullptr);
+  if (r < 0) {
+    fprintf(stderr, "portd: announcing the gateway: %s\n", strerror(-r));
   }
 }

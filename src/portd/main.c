@@ -49,6 +49,7 @@ int main(void) {
                    (client_callbacks_t){
                        .changed = bus_mapping_changed,
                        .removed = bus_mapping_removed,
+                       .gateway_changed = bus_gateway_changed,
                        .userdata = &bus,
                    });
   if (r < 0) {

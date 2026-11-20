@@ -29,6 +29,8 @@ typedef struct client_callbacks {
   void (*removed)(void *userdata,
                   mapping_t const *mapping,
                   nat_result_t const *failure);
+  // When the gateway, the protocol it speaks or the external address changed
+  void (*gateway_changed)(void *userdata);
   void *userdata;
 } client_callbacks_t;
 
@@ -40,8 +42,12 @@ typedef struct client {
   sd_event_source *announcements;
   // For the session and the mappings' expiry
   sd_event_source *timer;
+  // No ifindex while there's none
+  gateway_t gateway;
   // Null while there's no gateway
   nat_session_t *nat;
+  // The last one the gateway granted, 0.0.0.0 until then
+  pcp_ip_address_t external;
   uint16_t capacity;
   uint16_t count;
   mapping_t *mappings;

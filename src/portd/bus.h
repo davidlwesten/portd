@@ -20,3 +20,4 @@ void bus_mapping_changed(void *userdata, mapping_t const *mapping);
 void bus_mapping_removed(void *userdata,
                          mapping_t const *mapping,
                          nat_result_t const *failure);
+void bus_gateway_changed(void *userdata);
