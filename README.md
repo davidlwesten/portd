@@ -10,7 +10,7 @@ but there's no bus policy to install yet, and `portctl` is still to come.
 
 ## Building
 
-portd needs a C23 compiler, CMake 3.24 or newer, libmnl, and libsystemd 253 or
+portd needs a C23 compiler, CMake 3.28 or newer, libmnl, and libsystemd 253 or
 newer. [libpcp](https://github.com/byo-io/libpcp) and
 [libnatpmp](https://github.com/byo-io/libnatpmp) are used when installed, and
 fetched otherwise.

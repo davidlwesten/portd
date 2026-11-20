@@ -3,7 +3,8 @@ FetchContent_Declare(
   unity
   GIT_REPOSITORY https://github.com/ThrowTheSwitch/Unity.git
   GIT_TAG v2.7.0
-  GIT_SHALLOW TRUE)
+  GIT_SHALLOW TRUE
+  EXCLUDE_FROM_ALL)
 FetchContent_MakeAvailable(unity)
 
 # A copy of the module built with the sanitizers, so its memory errors and
