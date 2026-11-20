@@ -16,6 +16,9 @@ static char const MAPPING_INTERFACE[] = "io.github.davidlwesten.Portd1.Mapping";
 static char const ALREADY_MAPPED[] =
     "io.github.davidlwesten.Portd1.Error.AlreadyMapped";
 
+// Root has no limit
+static constexpr size_t MAPPINGS_PER_USER = 16;
+
 // Room for the prefix, a slash and any id
 typedef struct mapping_path {
   char value[sizeof(MAPPINGS_PATH) + 1 + 20];
@@ -47,6 +50,16 @@ static uint64_t id_of(char const *path) {
 static mapping_t const *mapping_at(bus_t const *bus, char const *path) {
   uint64_t const id = id_of(path);
   return id != 0 ? client_find(bus->client, id) : nullptr;
+}
+
+static size_t mappings_of(client_t const *client, uid_t owner) {
+  size_t count = 0;
+  for (size_t i = 0; i < client->count; i++) {
+    if (client->mappings[i].owner == owner) {
+      count++;
+    }
+  }
+  return count;
 }
 
 [[nodiscard]] static int sender_uid(sd_bus_message *message, uid_t *uid) {
@@ -142,6 +155,11 @@ on_map(sd_bus_message *message, void *userdata, sd_bus_error *error) {
     r = sd_bus_emit_properties_changed(bus->bus, path_of(id).value,
                                        MAPPING_INTERFACE, "Expires", nullptr);
   } else {
+    if (uid != 0 && mappings_of(bus->client, uid) >= MAPPINGS_PER_USER) {
+      return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED,
+                               "Each user can have up to %zu mappings",
+                               MAPPINGS_PER_USER);
+    }
     r = client_map(bus->client, uid, protocol, port, lifetime, &id);
     if (r < 0) {
       return r;
