@@ -6,7 +6,7 @@ NAT-PMP when that's all the gateway supports. Applications request
 mappings over D-Bus, and `portctl` will do the same from the command line.
 
 portd is in early development: the daemon serves mappings on the system bus,
-but there's no bus policy to install yet, and `portctl` is still to come.
+and `portctl` is still to come.
 
 ## Building
 
@@ -20,6 +20,19 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build
 ```
+
+## Installing
+
+```sh
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr
+cmake --build build
+sudo cmake --install build
+sudo systemd-sysusers
+sudo systemctl reload dbus
+```
+
+portd runs as the `portd` user and is started by the bus when something first
+asks for a mapping.
 
 ## License
 

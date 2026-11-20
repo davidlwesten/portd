@@ -1,0 +1,5 @@
+[D-BUS Service]
+Name=io.github.davidlwesten.Portd1
+Exec=@CMAKE_INSTALL_FULL_BINDIR@/portd
+User=portd
+SystemdService=portd.service

@@ -1,0 +1,8 @@
+[Unit]
+Description=Port mappings on the gateway
+
+[Service]
+Type=dbus
+BusName=io.github.davidlwesten.Portd1
+ExecStart=@CMAKE_INSTALL_FULL_BINDIR@/portd
+User=portd

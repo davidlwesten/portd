@@ -4,6 +4,7 @@ project(portd VERSION 0.1.0 LANGUAGES C)
 
 option(PORTD_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
+include(GNUInstallDirs)
 include(cmake/warnings.cmake)
 
 set(CMAKE_C_STANDARD 23)
@@ -32,6 +33,7 @@ pkg_check_modules(libsystemd REQUIRED IMPORTED_TARGET libsystemd>=253)
 
 add_subdirectory(lib)
 add_subdirectory(src/portd)
+add_subdirectory(data)
 
 include(CTest)
 if(BUILD_TESTING)
