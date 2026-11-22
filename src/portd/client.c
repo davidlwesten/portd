@@ -91,8 +91,8 @@ static void expire(client_t *client, uint64_t now) {
       i++;
       continue;
     }
-    fprintf(stderr, "portd: %s/%u expired\n",
-            nat_protocol_name(mapping->protocol), (unsigned)mapping->port);
+    fprintf(stderr, "portd: %u/%s expired\n", (unsigned)mapping->port,
+            nat_protocol_name(mapping->protocol));
     // Puts another mapping at `i`
     release(client, mapping);
   }
@@ -140,9 +140,8 @@ static void on_event(client_t *client, nat_event_t const *event) {
     char external[PCP_SOCKET_ADDRESS_STRING_LENGTH];
     pcp_socket_address_to_string(sizeof(external), external,
                                  &event->mapped.external);
-    fprintf(stderr, "portd: %s/%u reachable at %s\n",
-            nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
-            external);
+    fprintf(stderr, "portd: %u/%s reachable at %s\n", (unsigned)mapping->port,
+            nat_protocol_name(mapping->protocol), external);
     // NAT-PMP's is 0.0.0.0 until the gateway gave it
     if (memcmp(&event->mapped.external.ip, &pcp_ip_address_any_v4,
                sizeof(pcp_ip_address_any_v4)) != 0) {
@@ -153,14 +152,14 @@ static void on_event(client_t *client, nat_event_t const *event) {
   }
   case NAT_EVENT_UNMAPPED:
     mapping = find_mapping(client, event->unmapped.id);
-    fprintf(stderr, "portd: %s/%u lost, requesting it again\n",
-            nat_protocol_name(mapping->protocol), (unsigned)mapping->port);
+    fprintf(stderr, "portd: %u/%s lost, requesting it again\n",
+            (unsigned)mapping->port, nat_protocol_name(mapping->protocol));
     set_external_port(client, mapping, 0);
     break;
   case NAT_EVENT_FAILED:
     mapping = find_mapping(client, event->failed.id);
-    fprintf(stderr, "portd: %s/%u failed with result %u\n",
-            nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
+    fprintf(stderr, "portd: %u/%s failed with result %u\n",
+            (unsigned)mapping->port, nat_protocol_name(mapping->protocol),
             (unsigned)event->failed.result);
     remove_mapping(client, mapping, &event->failed.result);
     break;
@@ -450,9 +449,8 @@ static void request_all(client_t *client) {
     int const r = request(client, mapping,
                           left < UINT32_MAX ? (uint32_t)left : UINT32_MAX);
     if (r < 0) {
-      fprintf(stderr, "portd: requesting %s/%u: %s\n",
-              nat_protocol_name(mapping->protocol), (unsigned)mapping->port,
-              strerror(-r));
+      fprintf(stderr, "portd: requesting %u/%s: %s\n", (unsigned)mapping->port,
+              nat_protocol_name(mapping->protocol), strerror(-r));
       nat_result_t const failure = NAT_RESULT_OTHER;
       // Puts another mapping at `i`
       remove_mapping(client, mapping, &failure);

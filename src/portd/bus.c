@@ -147,8 +147,8 @@ on_map(sd_bus_message *message, void *userdata, sd_bus_error *error) {
   if (existing != nullptr) {
     if (existing->owner != uid) {
       return sd_bus_error_setf(error, ALREADY_MAPPED,
-                               "%s/%u is mapped by another user", protocol_name,
-                               (unsigned)port);
+                               "%u/%s is mapped by another user",
+                               (unsigned)port, protocol_name);
     }
     id = existing->id;
     client_extend(bus->client, id, lifetime);
