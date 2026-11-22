@@ -125,16 +125,19 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
   return sd_bus_message_exit_container(reply);
 }
 
-// Prints each mapping in a GetManagedObjects reply, returning how many
-[[nodiscard]] static int print_mappings(sd_bus_message *reply,
-                                        char const *external) {
-  int count = 0;
+typedef void
+visit_t(void *userdata, char const *path, mapping_t const *mapping);
+
+// Calls `visit` for each mapping in a GetManagedObjects reply
+[[nodiscard]] static int
+for_each_mapping(sd_bus_message *reply, visit_t *visit, void *userdata) {
   int r = sd_bus_message_enter_container(reply, 'a', "{oa{sa{sv}}}");
   if (r < 0) {
     return r;
   }
   while ((r = sd_bus_message_enter_container(reply, 'e', "oa{sa{sv}}")) > 0) {
-    r = sd_bus_message_skip(reply, "o");
+    char const *path;
+    r = sd_bus_message_read(reply, "o", &path);
     if (r < 0) {
       return r;
     }
@@ -154,11 +157,7 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
         if (r < 0) {
           return r;
         }
-        if (count++ == 0) {
-          printf("%-11s %-21s %-10s %s\n", "PORT", "EXTERNAL", "OWNER",
-                 "EXPIRES");
-        }
-        print_mapping(&mapping, external);
+        visit(userdata, path, &mapping);
       } else {
         r = sd_bus_message_skip(reply, "a{sv}");
         if (r < 0) {
@@ -182,7 +181,28 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
       return r;
     }
   }
-  return r < 0 ? r : count;
+  return r;
+}
+
+[[nodiscard]] static int
+get_mappings(sd_bus *bus, sd_bus_error *error, sd_bus_message **reply) {
+  return sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
+                            "org.freedesktop.DBus.ObjectManager",
+                            "GetManagedObjects", error, reply, "");
+}
+
+typedef struct listing {
+  char const *external;
+  size_t count;
+} listing_t;
+
+static void
+list_mapping(void *userdata, char const * /*path*/, mapping_t const *mapping) {
+  listing_t *listing = userdata;
+  if (listing->count++ == 0) {
+    printf("%-11s %-21s %-10s %s\n", "PORT", "EXTERNAL", "OWNER", "EXPIRES");
+  }
+  print_mapping(mapping, listing->external);
 }
 
 [[nodiscard]] static int get_string(sd_bus *bus,
@@ -208,9 +228,7 @@ static int status(sd_bus *bus) {
     r = get_string(bus, "ExternalAddress", &error, &external);
   }
   if (r >= 0) {
-    r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
-                           "org.freedesktop.DBus.ObjectManager",
-                           "GetManagedObjects", &error, &reply, "");
+    r = get_mappings(bus, &error, &reply);
   }
   if (r < 0) {
     print_error("asking portd", &error, r);
@@ -224,11 +242,12 @@ static int status(sd_bus *bus) {
              external);
     }
     printf("\n");
-    r = print_mappings(reply, external);
-    if (r == 0) {
-      printf("No mappings\n");
-    } else if (r < 0) {
+    listing_t listing = {.external = external};
+    r = for_each_mapping(reply, list_mapping, &listing);
+    if (r < 0) {
       print_error("reading the mappings", &error, r);
+    } else if (listing.count == 0) {
+      printf("No mappings\n");
     }
   }
   sd_bus_message_unref(reply);
@@ -245,7 +264,8 @@ static constexpr uint64_t PATIENCE_US = 2'000'000;
 
 static char const USAGE[] =
     "usage: portctl status\n"
-    "       portctl map PORT/PROTOCOL [--lifetime DURATION]\n";
+    "       portctl map PORT/PROTOCOL [--lifetime DURATION]\n"
+    "       portctl release PORT/PROTOCOL\n";
 
 // Seconds, or a number with an s, m, h or d suffix
 static bool parse_lifetime(char const *text, uint32_t *lifetime) {
@@ -511,10 +531,66 @@ static int map(sd_bus *bus, int argc, char *argv[]) {
   return result;
 }
 
+typedef struct search {
+  uint16_t port;
+  char const *protocol;
+  // Null until found
+  char *path;
+  bool out_of_memory;
+} search_t;
+
+static void
+find_mapping(void *userdata, char const *path, mapping_t const *mapping) {
+  search_t *search = userdata;
+  if (search->path == nullptr && mapping->port == search->port &&
+      strcmp(mapping->protocol, search->protocol) == 0) {
+    search->path = strdup(path);
+    search->out_of_memory = search->path == nullptr;
+  }
+}
+
+static int release(sd_bus *bus, char const *text) {
+  search_t search = {};
+  if (!parse_port(text, &search.port, &search.protocol)) {
+    fputs(USAGE, stderr);
+    return 2;
+  }
+
+  sd_bus_error error = SD_BUS_ERROR_NULL;
+  sd_bus_message *reply = nullptr;
+  int r = get_mappings(bus, &error, &reply);
+  if (r >= 0) {
+    r = for_each_mapping(reply, find_mapping, &search);
+  }
+  if (r >= 0 && search.out_of_memory) {
+    r = -ENOMEM;
+  }
+  if (r >= 0 && search.path != nullptr) {
+    r = sd_bus_call_method(bus, PORTD1_NAME, search.path,
+                           PORTD1_MAPPING_INTERFACE, "Release", &error, nullptr,
+                           "");
+  }
+
+  int result = EXIT_FAILURE;
+  if (r < 0) {
+    fprintf(stderr, "portctl: releasing %s: %s\n", text,
+            sd_bus_error_is_set(&error) ? error.message : strerror(-r));
+  } else if (search.path == nullptr) {
+    fprintf(stderr, "portctl: %s isn't mapped\n", text);
+  } else {
+    result = EXIT_SUCCESS;
+  }
+  free(search.path);
+  sd_bus_message_unref(reply);
+  sd_bus_error_free(&error);
+  return result;
+}
+
 int main(int argc, char *argv[]) {
   bool const is_status = argc == 2 && strcmp(argv[1], "status") == 0;
   bool const is_map = argc >= 2 && strcmp(argv[1], "map") == 0;
-  if (!is_status && !is_map) {
+  bool const is_release = argc == 3 && strcmp(argv[1], "release") == 0;
+  if (!is_status && !is_map && !is_release) {
     fputs(USAGE, stderr);
     return 2;
   }
@@ -527,7 +603,14 @@ int main(int argc, char *argv[]) {
     return EXIT_FAILURE;
   }
   // Each command parses its own options, with the command as argv[0]
-  int const result = is_status ? status(bus) : map(bus, argc - 1, &argv[1]);
+  int result;
+  if (is_status) {
+    result = status(bus);
+  } else if (is_map) {
+    result = map(bus, argc - 1, &argv[1]);
+  } else {
+    result = release(bus, argv[2]);
+  }
   sd_bus_flush_close_unref(bus);
   return result;
 }

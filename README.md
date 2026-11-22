@@ -3,10 +3,21 @@
 A daemon that keeps port mappings open for this machine on its gateway. It
 follows the default gateway over netlink and speaks PCP, falling back to
 NAT-PMP when that's all the gateway supports. Applications request
-mappings over D-Bus, and `portctl` will do the same from the command line.
+mappings over D-Bus, and `portctl` does the same from the command line.
 
-portd is in early development: the daemon serves mappings on the system bus,
-and `portctl` is still to come.
+portd is in early development.
+
+## Usage
+
+```sh
+portctl map 12345/udp --lifetime 2h
+portctl status
+portctl release 12345/udp
+```
+
+`map` waits for the gateway and prints the external address it granted. A
+mapping lasts an hour unless `--lifetime` says otherwise, and asking again
+extends it.
 
 ## Building
 
