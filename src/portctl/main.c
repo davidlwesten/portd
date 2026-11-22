@@ -10,16 +10,8 @@
 
 #include <systemd/sd-bus.h>
 
+#include "bus.h"
 #include "portd1.h"
-
-typedef struct mapping {
-  char const *protocol;
-  uint16_t port;
-  uint32_t owner;
-  // CLOCK_REALTIME microseconds
-  uint64_t expires;
-  uint16_t external_port;
-} mapping_t;
 
 static uint64_t now(clockid_t clock) {
   struct timespec time;
@@ -85,156 +77,6 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
   printf("%-11s %-21s %-10s in %s\n", port, external_port, owner, expires);
 }
 
-// Reads one property of a Mapping interface, skipping those it doesn't know
-[[nodiscard]] static int read_property(sd_bus_message *reply,
-                                       mapping_t *mapping) {
-  char const *name;
-  int const r = sd_bus_message_read(reply, "s", &name);
-  if (r < 0) {
-    return r;
-  }
-
-  if (strcmp(name, "Protocol") == 0) {
-    return sd_bus_message_read(reply, "v", "s", &mapping->protocol);
-  }
-  if (strcmp(name, "Port") == 0) {
-    return sd_bus_message_read(reply, "v", "q", &mapping->port);
-  }
-  if (strcmp(name, "Owner") == 0) {
-    return sd_bus_message_read(reply, "v", "u", &mapping->owner);
-  }
-  if (strcmp(name, "Expires") == 0) {
-    return sd_bus_message_read(reply, "v", "t", &mapping->expires);
-  }
-  if (strcmp(name, "ExternalPort") == 0) {
-    return sd_bus_message_read(reply, "v", "q", &mapping->external_port);
-  }
-  return sd_bus_message_skip(reply, "v");
-}
-
-// Reads the properties of a Mapping interface, leaving those that aren't there
-// as they were
-[[nodiscard]] static int read_mapping(sd_bus_message *reply,
-                                      mapping_t *mapping) {
-  int r = sd_bus_message_enter_container(reply, 'a', "{sv}");
-  if (r < 0) {
-    return r;
-  }
-
-  for (;;) {
-    r = sd_bus_message_enter_container(reply, 'e', "sv");
-    if (r < 0) {
-      return r;
-    }
-    if (r == 0) {
-      return sd_bus_message_exit_container(reply);
-    }
-
-    r = read_property(reply, mapping);
-    if (r < 0) {
-      return r;
-    }
-    r = sd_bus_message_exit_container(reply);
-    if (r < 0) {
-      return r;
-    }
-  }
-}
-
-typedef void
-visit_t(void *userdata, char const *path, mapping_t const *mapping);
-
-// One interface of the object at `path`, with its properties
-[[nodiscard]] static int read_interface(sd_bus_message *reply,
-                                        char const *path,
-                                        visit_t *visit,
-                                        void *userdata) {
-  char const *interface;
-  int r = sd_bus_message_read(reply, "s", &interface);
-  if (r < 0) {
-    return r;
-  }
-  if (strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
-    return sd_bus_message_skip(reply, "a{sv}");
-  }
-
-  mapping_t mapping = {.protocol = ""};
-  r = read_mapping(reply, &mapping);
-  if (r < 0) {
-    return r;
-  }
-  visit(userdata, path, &mapping);
-  return 0;
-}
-
-// One object's path and its interfaces
-[[nodiscard]] static int
-read_object(sd_bus_message *reply, visit_t *visit, void *userdata) {
-  char const *path;
-  int r = sd_bus_message_read(reply, "o", &path);
-  if (r < 0) {
-    return r;
-  }
-  r = sd_bus_message_enter_container(reply, 'a', "{sa{sv}}");
-  if (r < 0) {
-    return r;
-  }
-
-  for (;;) {
-    r = sd_bus_message_enter_container(reply, 'e', "sa{sv}");
-    if (r < 0) {
-      return r;
-    }
-    if (r == 0) {
-      return sd_bus_message_exit_container(reply);
-    }
-
-    r = read_interface(reply, path, visit, userdata);
-    if (r < 0) {
-      return r;
-    }
-    r = sd_bus_message_exit_container(reply);
-    if (r < 0) {
-      return r;
-    }
-  }
-}
-
-// Calls `visit` for each mapping in a GetManagedObjects reply
-[[nodiscard]] static int
-for_each_mapping(sd_bus_message *reply, visit_t *visit, void *userdata) {
-  int r = sd_bus_message_enter_container(reply, 'a', "{oa{sa{sv}}}");
-  if (r < 0) {
-    return r;
-  }
-
-  for (;;) {
-    r = sd_bus_message_enter_container(reply, 'e', "oa{sa{sv}}");
-    if (r < 0) {
-      return r;
-    }
-    if (r == 0) {
-      return sd_bus_message_exit_container(reply);
-    }
-
-    r = read_object(reply, visit, userdata);
-    if (r < 0) {
-      return r;
-    }
-    r = sd_bus_message_exit_container(reply);
-    if (r < 0) {
-      return r;
-    }
-  }
-}
-
-[[nodiscard]] static int
-get_mappings(sd_bus *bus, sd_bus_error *error, sd_bus_message **reply) {
-  return sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
-                            "org.freedesktop.DBus.ObjectManager",
-                            "GetManagedObjects", error, reply, "");
-}
-
 typedef struct listing {
   char const *external;
   size_t count;
@@ -249,9 +91,8 @@ list_mapping(void *userdata, char const * /*path*/, mapping_t const *mapping) {
   print_mapping(mapping, listing->external);
 }
 
-[[nodiscard]] static int list_mappings(sd_bus *bus,
-                                       sd_bus_error *error,
-                                       char const *external) {
+[[nodiscard]] static int
+list_mappings(sd_bus *bus, sd_bus_error *error, char const *external) {
   sd_bus_message *reply = nullptr;
   int r = get_mappings(bus, error, &reply);
   if (r < 0) {
@@ -275,15 +116,6 @@ typedef struct manager {
   char *protocol;
   char *external;
 } manager_t;
-
-[[nodiscard]] static int get_string(sd_bus *bus,
-                                    char const *property,
-                                    sd_bus_error *error,
-                                    char **value) {
-  return sd_bus_get_property_string(bus, PORTD1_NAME, PORTD1_PATH,
-                                    PORTD1_MANAGER_INTERFACE, property, error,
-                                    value);
-}
 
 [[nodiscard]] static int
 get_manager(sd_bus *bus, sd_bus_error *error, manager_t *manager) {
