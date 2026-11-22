@@ -33,6 +33,7 @@ pkg_check_modules(libsystemd REQUIRED IMPORTED_TARGET libsystemd>=253)
 
 add_subdirectory(lib)
 add_subdirectory(src/portd)
+add_subdirectory(src/portctl)
 add_subdirectory(data)
 
 include(CTest)
