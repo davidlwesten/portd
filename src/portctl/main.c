@@ -1,3 +1,5 @@
+#include <errno.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <pwd.h>
 #include <stdint.h>
@@ -18,6 +20,12 @@ typedef struct mapping {
   uint64_t expires;
   uint16_t external_port;
 } mapping_t;
+
+static uint64_t now(clockid_t clock) {
+  struct timespec time;
+  clock_gettime(clock, &time);
+  return (uint64_t)time.tv_sec * 1000000 + (uint64_t)time.tv_nsec / 1000;
+}
 
 static void print_error(char const *doing, sd_bus_error const *error, int r) {
   fprintf(stderr, "portctl: %s: %s\n", doing,
@@ -67,10 +75,7 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
     snprintf(owner, sizeof(owner), "%" PRIu32, mapping->owner);
   }
 
-  struct timespec now;
-  clock_gettime(CLOCK_REALTIME, &now);
-  uint64_t const now_us =
-      (uint64_t)now.tv_sec * 1000000 + (uint64_t)now.tv_nsec / 1000;
+  uint64_t const now_us = now(CLOCK_REALTIME);
   char expires[32];
   format_duration(sizeof(expires), expires,
                   mapping->expires > now_us
@@ -234,9 +239,283 @@ static int status(sd_bus *bus) {
   return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
+static constexpr uint32_t DEFAULT_LIFETIME = 3600;
+// How long to wait before saying the gateway hasn't answered yet
+static constexpr uint64_t PATIENCE_US = 2'000'000;
+
+static char const USAGE[] =
+    "usage: portctl status\n"
+    "       portctl map PORT/PROTOCOL [--lifetime DURATION]\n";
+
+// Seconds, or a number with an s, m, h or d suffix
+static bool parse_lifetime(char const *text, uint32_t *lifetime) {
+  char *end;
+  errno = 0;
+  unsigned long long const count = strtoull(text, &end, 10);
+  if (errno != 0 || end == text || text[0] == '-') {
+    return false;
+  }
+  unsigned long long unit;
+  switch (*end) {
+  case '\0':
+  case 's':
+    unit = 1;
+    break;
+  case 'm':
+    unit = 60;
+    break;
+  case 'h':
+    unit = 3600;
+    break;
+  case 'd':
+    unit = 86400;
+    break;
+  default:
+    return false;
+  }
+  if (*end != '\0' && end[1] != '\0') {
+    return false;
+  }
+  if (count == 0 || count > UINT32_MAX / unit) {
+    return false;
+  }
+  *lifetime = (uint32_t)(count * unit);
+  return true;
+}
+
+// Splits "12345/udp", leaving the protocol for portd to check
+static bool
+parse_port(char const *text, uint16_t *port, char const **protocol) {
+  char *end;
+  errno = 0;
+  unsigned long const value = strtoul(text, &end, 10);
+  if (errno != 0 || end == text || text[0] == '-' || *end != '/' ||
+      value == 0 || value > UINT16_MAX || end[1] == '\0') {
+    return false;
+  }
+  *port = (uint16_t)value;
+  *protocol = &end[1];
+  return true;
+}
+
+typedef struct wait {
+  // Null until Map replies
+  char *path;
+  bool done;
+  uint16_t external_port;
+  // Set if the mapping failed
+  char *reason;
+} wait_t;
+
+static bool is_ours(wait_t const *wait, sd_bus_message *message) {
+  return wait->path != nullptr &&
+         strcmp(sd_bus_message_get_path(message), wait->path) == 0;
+}
+
+static int on_properties_changed(sd_bus_message *message,
+                                 void *userdata,
+                                 sd_bus_error * /*error*/) {
+  wait_t *wait = userdata;
+  if (!is_ours(wait, message)) {
+    return 0;
+  }
+  char const *interface;
+  int r = sd_bus_message_read(message, "s", &interface);
+  if (r < 0 || strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
+    return r;
+  }
+  r = sd_bus_message_enter_container(message, 'a', "{sv}");
+  if (r < 0) {
+    return r;
+  }
+  while ((r = sd_bus_message_enter_container(message, 'e', "sv")) > 0) {
+    char const *name;
+    r = sd_bus_message_read(message, "s", &name);
+    if (r < 0) {
+      return r;
+    }
+    if (strcmp(name, "ExternalPort") == 0) {
+      r = sd_bus_message_read(message, "v", "q", &wait->external_port);
+      wait->done = wait->external_port != 0;
+    } else {
+      r = sd_bus_message_skip(message, "v");
+    }
+    if (r < 0) {
+      return r;
+    }
+    r = sd_bus_message_exit_container(message);
+    if (r < 0) {
+      return r;
+    }
+  }
+  return r;
+}
+
+static int
+on_failed(sd_bus_message *message, void *userdata, sd_bus_error * /*error*/) {
+  wait_t *wait = userdata;
+  if (!is_ours(wait, message)) {
+    return 0;
+  }
+  char const *reason;
+  int const r = sd_bus_message_read(message, "s", &reason);
+  if (r < 0) {
+    return r;
+  }
+  wait->reason = strdup(reason);
+  wait->done = true;
+  return wait->reason != nullptr ? 0 : -ENOMEM;
+}
+
+static int on_interfaces_removed(sd_bus_message *message,
+                                 void *userdata,
+                                 sd_bus_error * /*error*/) {
+  wait_t *wait = userdata;
+  char const *path;
+  int const r = sd_bus_message_read(message, "o", &path);
+  if (r < 0) {
+    return r;
+  }
+  if (wait->path != nullptr && strcmp(path, wait->path) == 0) {
+    wait->done = true;
+  }
+  return 0;
+}
+
+// Watches before mapping, so no answer from the gateway can be missed
+[[nodiscard]] static int watch(sd_bus *bus, wait_t *wait) {
+  int r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
+                              "org.freedesktop.DBus.Properties",
+                              "PropertiesChanged", on_properties_changed, wait);
+  if (r >= 0) {
+    r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
+                            PORTD1_MAPPING_INTERFACE, "Failed", on_failed,
+                            wait);
+  }
+  if (r >= 0) {
+    r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, PORTD1_PATH,
+                            "org.freedesktop.DBus.ObjectManager",
+                            "InterfacesRemoved", on_interfaces_removed, wait);
+  }
+  return r;
+}
+
+[[nodiscard]] static int run_until_done(sd_bus *bus, wait_t *wait) {
+  uint64_t const start = now(CLOCK_MONOTONIC);
+  bool told = false;
+  while (!wait->done) {
+    int r = sd_bus_process(bus, nullptr);
+    if (r < 0) {
+      return r;
+    }
+    if (r > 0) {
+      continue;
+    }
+    uint64_t timeout = UINT64_MAX;
+    if (!told) {
+      uint64_t const waited = now(CLOCK_MONOTONIC) - start;
+      if (waited >= PATIENCE_US) {
+        fprintf(stderr, "Waiting for the gateway...\n");
+        told = true;
+      } else {
+        timeout = PATIENCE_US - waited;
+      }
+    }
+    r = sd_bus_wait(bus, timeout);
+    if (r < 0) {
+      return r;
+    }
+  }
+  return 0;
+}
+
+static int map(sd_bus *bus, int argc, char *argv[]) {
+  static struct option const options[] = {
+      {"lifetime", required_argument, nullptr, 'l'},
+      {},
+  };
+  uint32_t lifetime = DEFAULT_LIFETIME;
+  int option;
+  while ((option = getopt_long(argc, argv, "l:", options, nullptr)) != -1) {
+    if (option != 'l' || !parse_lifetime(optarg, &lifetime)) {
+      fputs(USAGE, stderr);
+      return 2;
+    }
+  }
+  uint16_t port;
+  char const *protocol;
+  if (optind != argc - 1 || !parse_port(argv[optind], &port, &protocol)) {
+    fputs(USAGE, stderr);
+    return 2;
+  }
+
+  sd_bus_error error = SD_BUS_ERROR_NULL;
+  sd_bus_message *reply = nullptr;
+  char *external = nullptr;
+  wait_t wait = {};
+  int r = watch(bus, &wait);
+  if (r >= 0) {
+    r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
+                           PORTD1_MANAGER_INTERFACE, "Map", &error, &reply,
+                           "squa{sv}", protocol, port, lifetime, 0);
+  }
+  char const *path;
+  if (r >= 0) {
+    r = sd_bus_message_read(reply, "o", &path);
+  }
+  if (r >= 0) {
+    wait.path = strdup(path);
+    r = wait.path != nullptr ? 0 : -ENOMEM;
+  }
+  // A mapping that's extended may have been granted already. One that's gone
+  // already has its signals waiting.
+  if (r >= 0) {
+    r = sd_bus_get_property_trivial(bus, PORTD1_NAME, wait.path,
+                                    PORTD1_MAPPING_INTERFACE, "ExternalPort",
+                                    &error, 'q', &wait.external_port);
+    if (sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_OBJECT)) {
+      sd_bus_error_free(&error);
+      r = 0;
+    }
+    wait.done = wait.external_port != 0;
+  }
+  if (r >= 0) {
+    r = run_until_done(bus, &wait);
+  }
+  if (r >= 0 && wait.external_port != 0) {
+    r = sd_bus_get_property_string(bus, PORTD1_NAME, PORTD1_PATH,
+                                   PORTD1_MANAGER_INTERFACE, "ExternalAddress",
+                                   &error, &external);
+  }
+
+  int result = EXIT_FAILURE;
+  if (r < 0) {
+    fprintf(stderr, "portctl: mapping %u/%s: %s\n", (unsigned)port, protocol,
+            sd_bus_error_is_set(&error) ? error.message : strerror(-r));
+  } else if (wait.external_port != 0) {
+    printf("%u/%s reachable at %s%s%u\n", (unsigned)port, protocol, external,
+           external[0] != '\0' ? ":" : "port ", (unsigned)wait.external_port);
+    result = EXIT_SUCCESS;
+  } else if (wait.reason != nullptr) {
+    fprintf(stderr, "portctl: %u/%s failed: %s\n", (unsigned)port, protocol,
+            wait.reason);
+  } else {
+    fprintf(stderr, "portctl: %u/%s went away before the gateway granted it\n",
+            (unsigned)port, protocol);
+  }
+  free(external);
+  free(wait.reason);
+  free(wait.path);
+  sd_bus_message_unref(reply);
+  sd_bus_error_free(&error);
+  return result;
+}
+
 int main(int argc, char *argv[]) {
-  if (argc != 2 || strcmp(argv[1], "status") != 0) {
-    fprintf(stderr, "usage: portctl status\n");
+  bool const is_status = argc == 2 && strcmp(argv[1], "status") == 0;
+  bool const is_map = argc >= 2 && strcmp(argv[1], "map") == 0;
+  if (!is_status && !is_map) {
+    fputs(USAGE, stderr);
     return 2;
   }
 
@@ -247,7 +526,8 @@ int main(int argc, char *argv[]) {
             strerror(-r));
     return EXIT_FAILURE;
   }
-  int const result = status(bus);
+  // Each command parses its own options, with the command as argv[0]
+  int const result = is_status ? status(bus) : map(bus, argc - 1, &argv[1]);
   sd_bus_flush_close_unref(bus);
   return result;
 }
