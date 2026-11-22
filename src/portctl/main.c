@@ -93,15 +93,8 @@ list_mapping(void *userdata, char const * /*path*/, mapping_t const *mapping) {
 
 [[nodiscard]] static int
 list_mappings(sd_bus *bus, sd_bus_error *error, char const *external) {
-  sd_bus_message *reply = nullptr;
-  int r = get_mappings(bus, error, &reply);
-  if (r < 0) {
-    return r;
-  }
-
   listing_t listing = {.external = external};
-  r = for_each_mapping(reply, list_mapping, &listing);
-  sd_bus_message_unref(reply);
+  int const r = for_each_mapping(bus, error, list_mapping, &listing);
   if (r < 0) {
     return r;
   }
@@ -339,30 +332,6 @@ static int on_interfaces_removed(sd_bus_message *message,
                              "InterfacesRemoved", on_interfaces_removed, wait);
 }
 
-[[nodiscard]] static int request_mapping(sd_bus *bus,
-                                         sd_bus_error *error,
-                                         char const *protocol,
-                                         uint16_t port,
-                                         uint32_t lifetime,
-                                         wait_t *wait) {
-  sd_bus_message *reply = nullptr;
-  int r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
-                             PORTD1_MANAGER_INTERFACE, "Map", error, &reply,
-                             "squa{sv}", protocol, port, lifetime, 0);
-  if (r < 0) {
-    return r;
-  }
-
-  char const *path;
-  r = sd_bus_message_read(reply, "o", &path);
-  if (r >= 0) {
-    wait->path = strdup(path);
-    r = wait->path != nullptr ? 0 : -ENOMEM;
-  }
-  sd_bus_message_unref(reply);
-  return r;
-}
-
 // A mapping that's extended may have been granted already. One that's gone
 // already has its signals waiting.
 [[nodiscard]] static int
@@ -422,7 +391,7 @@ check_granted(sd_bus *bus, sd_bus_error *error, wait_t *wait) {
   if (r < 0) {
     return r;
   }
-  r = request_mapping(bus, error, protocol, port, lifetime, wait);
+  r = request_mapping(bus, error, protocol, port, lifetime, &wait->path);
   if (r < 0) {
     return r;
   }
@@ -512,14 +481,7 @@ find_mapping(void *userdata, char const *path, mapping_t const *mapping) {
 // Leaves the path null if there's no such mapping
 [[nodiscard]] static int
 search_mappings(sd_bus *bus, sd_bus_error *error, search_t *search) {
-  sd_bus_message *reply = nullptr;
-  int r = get_mappings(bus, error, &reply);
-  if (r < 0) {
-    return r;
-  }
-
-  r = for_each_mapping(reply, find_mapping, search);
-  sd_bus_message_unref(reply);
+  int const r = for_each_mapping(bus, error, find_mapping, search);
   if (r < 0) {
     return r;
   }

@@ -20,12 +20,20 @@ typedef struct mapping {
 typedef void
 visit_t(void *userdata, char const *path, mapping_t const *mapping);
 
-// Calls `visit` for each mapping in a GetManagedObjects reply
-[[nodiscard]] int
-for_each_mapping(sd_bus_message *reply, visit_t *visit, void *userdata);
+// Calls `visit` for each of portd's mappings, which are only valid during the
+// call
+[[nodiscard]] int for_each_mapping(sd_bus *bus,
+                                   sd_bus_error *error,
+                                   visit_t *visit,
+                                   void *userdata);
 
-[[nodiscard]] int
-get_mappings(sd_bus *bus, sd_bus_error *error, sd_bus_message **reply);
+// Leaves the new mapping's object path, or the existing one's, in `path`
+[[nodiscard]] int request_mapping(sd_bus *bus,
+                                  sd_bus_error *error,
+                                  char const *protocol,
+                                  uint16_t port,
+                                  uint32_t lifetime,
+                                  char **path);
 
 // A property of the Manager
 [[nodiscard]] int get_string(sd_bus *bus,
