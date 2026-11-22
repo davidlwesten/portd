@@ -85,32 +85,52 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
   printf("%-11s %-21s %-10s in %s\n", port, external_port, owner, expires);
 }
 
-// Reads the properties of one object's Mapping interface
+// Reads one property of a Mapping interface, skipping those it doesn't know
+[[nodiscard]] static int read_property(sd_bus_message *reply,
+                                       mapping_t *mapping) {
+  char const *name;
+  int const r = sd_bus_message_read(reply, "s", &name);
+  if (r < 0) {
+    return r;
+  }
+
+  if (strcmp(name, "Protocol") == 0) {
+    return sd_bus_message_read(reply, "v", "s", &mapping->protocol);
+  }
+  if (strcmp(name, "Port") == 0) {
+    return sd_bus_message_read(reply, "v", "q", &mapping->port);
+  }
+  if (strcmp(name, "Owner") == 0) {
+    return sd_bus_message_read(reply, "v", "u", &mapping->owner);
+  }
+  if (strcmp(name, "Expires") == 0) {
+    return sd_bus_message_read(reply, "v", "t", &mapping->expires);
+  }
+  if (strcmp(name, "ExternalPort") == 0) {
+    return sd_bus_message_read(reply, "v", "q", &mapping->external_port);
+  }
+  return sd_bus_message_skip(reply, "v");
+}
+
+// Reads the properties of a Mapping interface, leaving those that aren't there
+// as they were
 [[nodiscard]] static int read_mapping(sd_bus_message *reply,
                                       mapping_t *mapping) {
   int r = sd_bus_message_enter_container(reply, 'a', "{sv}");
   if (r < 0) {
     return r;
   }
-  while ((r = sd_bus_message_enter_container(reply, 'e', "sv")) > 0) {
-    char const *name;
-    r = sd_bus_message_read(reply, "s", &name);
+
+  for (;;) {
+    r = sd_bus_message_enter_container(reply, 'e', "sv");
     if (r < 0) {
       return r;
     }
-    if (strcmp(name, "Protocol") == 0) {
-      r = sd_bus_message_read(reply, "v", "s", &mapping->protocol);
-    } else if (strcmp(name, "Port") == 0) {
-      r = sd_bus_message_read(reply, "v", "q", &mapping->port);
-    } else if (strcmp(name, "Owner") == 0) {
-      r = sd_bus_message_read(reply, "v", "u", &mapping->owner);
-    } else if (strcmp(name, "Expires") == 0) {
-      r = sd_bus_message_read(reply, "v", "t", &mapping->expires);
-    } else if (strcmp(name, "ExternalPort") == 0) {
-      r = sd_bus_message_read(reply, "v", "q", &mapping->external_port);
-    } else {
-      r = sd_bus_message_skip(reply, "v");
+    if (r == 0) {
+      return sd_bus_message_exit_container(reply);
     }
+
+    r = read_property(reply, mapping);
     if (r < 0) {
       return r;
     }
@@ -119,14 +139,66 @@ static void print_mapping(mapping_t const *mapping, char const *external) {
       return r;
     }
   }
-  if (r < 0) {
-    return r;
-  }
-  return sd_bus_message_exit_container(reply);
 }
 
 typedef void
 visit_t(void *userdata, char const *path, mapping_t const *mapping);
+
+// One interface of the object at `path`, with its properties
+[[nodiscard]] static int read_interface(sd_bus_message *reply,
+                                        char const *path,
+                                        visit_t *visit,
+                                        void *userdata) {
+  char const *interface;
+  int r = sd_bus_message_read(reply, "s", &interface);
+  if (r < 0) {
+    return r;
+  }
+  if (strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
+    return sd_bus_message_skip(reply, "a{sv}");
+  }
+
+  mapping_t mapping = {.protocol = ""};
+  r = read_mapping(reply, &mapping);
+  if (r < 0) {
+    return r;
+  }
+  visit(userdata, path, &mapping);
+  return 0;
+}
+
+// One object's path and its interfaces
+[[nodiscard]] static int
+read_object(sd_bus_message *reply, visit_t *visit, void *userdata) {
+  char const *path;
+  int r = sd_bus_message_read(reply, "o", &path);
+  if (r < 0) {
+    return r;
+  }
+  r = sd_bus_message_enter_container(reply, 'a', "{sa{sv}}");
+  if (r < 0) {
+    return r;
+  }
+
+  for (;;) {
+    r = sd_bus_message_enter_container(reply, 'e', "sa{sv}");
+    if (r < 0) {
+      return r;
+    }
+    if (r == 0) {
+      return sd_bus_message_exit_container(reply);
+    }
+
+    r = read_interface(reply, path, visit, userdata);
+    if (r < 0) {
+      return r;
+    }
+    r = sd_bus_message_exit_container(reply);
+    if (r < 0) {
+      return r;
+    }
+  }
+}
 
 // Calls `visit` for each mapping in a GetManagedObjects reply
 [[nodiscard]] static int
@@ -135,44 +207,17 @@ for_each_mapping(sd_bus_message *reply, visit_t *visit, void *userdata) {
   if (r < 0) {
     return r;
   }
-  while ((r = sd_bus_message_enter_container(reply, 'e', "oa{sa{sv}}")) > 0) {
-    char const *path;
-    r = sd_bus_message_read(reply, "o", &path);
+
+  for (;;) {
+    r = sd_bus_message_enter_container(reply, 'e', "oa{sa{sv}}");
     if (r < 0) {
       return r;
     }
-    r = sd_bus_message_enter_container(reply, 'a', "{sa{sv}}");
-    if (r < 0) {
-      return r;
+    if (r == 0) {
+      return sd_bus_message_exit_container(reply);
     }
-    while ((r = sd_bus_message_enter_container(reply, 'e', "sa{sv}")) > 0) {
-      char const *interface;
-      r = sd_bus_message_read(reply, "s", &interface);
-      if (r < 0) {
-        return r;
-      }
-      if (strcmp(interface, PORTD1_MAPPING_INTERFACE) == 0) {
-        mapping_t mapping = {.protocol = ""};
-        r = read_mapping(reply, &mapping);
-        if (r < 0) {
-          return r;
-        }
-        visit(userdata, path, &mapping);
-      } else {
-        r = sd_bus_message_skip(reply, "a{sv}");
-        if (r < 0) {
-          return r;
-        }
-      }
-      r = sd_bus_message_exit_container(reply);
-      if (r < 0) {
-        return r;
-      }
-    }
-    if (r < 0) {
-      return r;
-    }
-    r = sd_bus_message_exit_container(reply);
+
+    r = read_object(reply, visit, userdata);
     if (r < 0) {
       return r;
     }
@@ -181,7 +226,6 @@ for_each_mapping(sd_bus_message *reply, visit_t *visit, void *userdata) {
       return r;
     }
   }
-  return r;
 }
 
 [[nodiscard]] static int
@@ -205,6 +249,33 @@ list_mapping(void *userdata, char const * /*path*/, mapping_t const *mapping) {
   print_mapping(mapping, listing->external);
 }
 
+[[nodiscard]] static int list_mappings(sd_bus *bus,
+                                       sd_bus_error *error,
+                                       char const *external) {
+  sd_bus_message *reply = nullptr;
+  int r = get_mappings(bus, error, &reply);
+  if (r < 0) {
+    return r;
+  }
+
+  listing_t listing = {.external = external};
+  r = for_each_mapping(reply, list_mapping, &listing);
+  sd_bus_message_unref(reply);
+  if (r < 0) {
+    return r;
+  }
+  if (listing.count == 0) {
+    printf("No mappings\n");
+  }
+  return 0;
+}
+
+typedef struct manager {
+  char *gateway;
+  char *protocol;
+  char *external;
+} manager_t;
+
 [[nodiscard]] static int get_string(sd_bus *bus,
                                     char const *property,
                                     sd_bus_error *error,
@@ -214,46 +285,46 @@ list_mapping(void *userdata, char const * /*path*/, mapping_t const *mapping) {
                                     value);
 }
 
+[[nodiscard]] static int
+get_manager(sd_bus *bus, sd_bus_error *error, manager_t *manager) {
+  int r = get_string(bus, "Gateway", error, &manager->gateway);
+  if (r < 0) {
+    return r;
+  }
+  r = get_string(bus, "GatewayProtocol", error, &manager->protocol);
+  if (r < 0) {
+    return r;
+  }
+  return get_string(bus, "ExternalAddress", error, &manager->external);
+}
+
+static void print_gateway(manager_t const *manager) {
+  if (manager->gateway[0] == '\0') {
+    printf("No gateway\n");
+  } else if (manager->external[0] == '\0') {
+    printf("Gateway %s (%s)\n", manager->gateway, manager->protocol);
+  } else {
+    printf("Gateway %s (%s), external address %s\n", manager->gateway,
+           manager->protocol, manager->external);
+  }
+}
+
 static int status(sd_bus *bus) {
   sd_bus_error error = SD_BUS_ERROR_NULL;
-  char *gateway = nullptr;
-  char *protocol = nullptr;
-  char *external = nullptr;
-  sd_bus_message *reply = nullptr;
-  int r = get_string(bus, "Gateway", &error, &gateway);
+  manager_t manager = {};
+  int r = get_manager(bus, &error, &manager);
   if (r >= 0) {
-    r = get_string(bus, "GatewayProtocol", &error, &protocol);
-  }
-  if (r >= 0) {
-    r = get_string(bus, "ExternalAddress", &error, &external);
-  }
-  if (r >= 0) {
-    r = get_mappings(bus, &error, &reply);
+    print_gateway(&manager);
+    printf("\n");
+    r = list_mappings(bus, &error, manager.external);
   }
   if (r < 0) {
     print_error("asking portd", &error, r);
-  } else {
-    if (gateway[0] == '\0') {
-      printf("No gateway\n");
-    } else if (external[0] == '\0') {
-      printf("Gateway %s (%s)\n", gateway, protocol);
-    } else {
-      printf("Gateway %s (%s), external address %s\n", gateway, protocol,
-             external);
-    }
-    printf("\n");
-    listing_t listing = {.external = external};
-    r = for_each_mapping(reply, list_mapping, &listing);
-    if (r < 0) {
-      print_error("reading the mappings", &error, r);
-    } else if (listing.count == 0) {
-      printf("No mappings\n");
-    }
   }
-  sd_bus_message_unref(reply);
-  free(external);
-  free(protocol);
-  free(gateway);
+
+  free(manager.external);
+  free(manager.protocol);
+  free(manager.gateway);
   sd_bus_error_free(&error);
   return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
@@ -309,13 +380,38 @@ parse_port(char const *text, uint16_t *port, char const **protocol) {
   char *end;
   errno = 0;
   unsigned long const value = strtoul(text, &end, 10);
-  if (errno != 0 || end == text || text[0] == '-' || *end != '/' ||
-      value == 0 || value > UINT16_MAX || end[1] == '\0') {
+  if (errno != 0 || end == text || text[0] == '-') {
     return false;
   }
+  if (value == 0 || value > UINT16_MAX) {
+    return false;
+  }
+  if (*end != '/' || end[1] == '\0') {
+    return false;
+  }
+
   *port = (uint16_t)value;
   *protocol = &end[1];
   return true;
+}
+
+static bool parse_map_arguments(int argc,
+                                char *argv[],
+                                uint16_t *port,
+                                char const **protocol,
+                                uint32_t *lifetime) {
+  static struct option const options[] = {
+      {"lifetime", required_argument, nullptr, 'l'},
+      {},
+  };
+  *lifetime = DEFAULT_LIFETIME;
+  int option;
+  while ((option = getopt_long(argc, argv, "l:", options, nullptr)) != -1) {
+    if (option != 'l' || !parse_lifetime(optarg, lifetime)) {
+      return false;
+    }
+  }
+  return optind == argc - 1 && parse_port(argv[optind], port, protocol);
 }
 
 typedef struct wait {
@@ -339,36 +435,26 @@ static int on_properties_changed(sd_bus_message *message,
   if (!is_ours(wait, message)) {
     return 0;
   }
+
   char const *interface;
   int r = sd_bus_message_read(message, "s", &interface);
-  if (r < 0 || strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
-    return r;
-  }
-  r = sd_bus_message_enter_container(message, 'a', "{sv}");
   if (r < 0) {
     return r;
   }
-  while ((r = sd_bus_message_enter_container(message, 'e', "sv")) > 0) {
-    char const *name;
-    r = sd_bus_message_read(message, "s", &name);
-    if (r < 0) {
-      return r;
-    }
-    if (strcmp(name, "ExternalPort") == 0) {
-      r = sd_bus_message_read(message, "v", "q", &wait->external_port);
-      wait->done = wait->external_port != 0;
-    } else {
-      r = sd_bus_message_skip(message, "v");
-    }
-    if (r < 0) {
-      return r;
-    }
-    r = sd_bus_message_exit_container(message);
-    if (r < 0) {
-      return r;
-    }
+  if (strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
+    return 0;
   }
-  return r;
+
+  mapping_t changed = {};
+  r = read_mapping(message, &changed);
+  if (r < 0) {
+    return r;
+  }
+  if (changed.external_port != 0) {
+    wait->external_port = changed.external_port;
+    wait->done = true;
+  }
+  return 0;
 }
 
 static int
@@ -377,6 +463,7 @@ on_failed(sd_bus_message *message, void *userdata, sd_bus_error * /*error*/) {
   if (!is_ours(wait, message)) {
     return 0;
   }
+
   char const *reason;
   int const r = sd_bus_message_read(message, "s", &reason);
   if (r < 0) {
@@ -407,17 +494,59 @@ static int on_interfaces_removed(sd_bus_message *message,
   int r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
                               "org.freedesktop.DBus.Properties",
                               "PropertiesChanged", on_properties_changed, wait);
-  if (r >= 0) {
-    r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
-                            PORTD1_MAPPING_INTERFACE, "Failed", on_failed,
-                            wait);
+  if (r < 0) {
+    return r;
   }
-  if (r >= 0) {
-    r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, PORTD1_PATH,
-                            "org.freedesktop.DBus.ObjectManager",
-                            "InterfacesRemoved", on_interfaces_removed, wait);
+  r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
+                          PORTD1_MAPPING_INTERFACE, "Failed", on_failed, wait);
+  if (r < 0) {
+    return r;
   }
+  return sd_bus_match_signal(bus, nullptr, PORTD1_NAME, PORTD1_PATH,
+                             "org.freedesktop.DBus.ObjectManager",
+                             "InterfacesRemoved", on_interfaces_removed, wait);
+}
+
+[[nodiscard]] static int request_mapping(sd_bus *bus,
+                                         sd_bus_error *error,
+                                         char const *protocol,
+                                         uint16_t port,
+                                         uint32_t lifetime,
+                                         wait_t *wait) {
+  sd_bus_message *reply = nullptr;
+  int r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
+                             PORTD1_MANAGER_INTERFACE, "Map", error, &reply,
+                             "squa{sv}", protocol, port, lifetime, 0);
+  if (r < 0) {
+    return r;
+  }
+
+  char const *path;
+  r = sd_bus_message_read(reply, "o", &path);
+  if (r >= 0) {
+    wait->path = strdup(path);
+    r = wait->path != nullptr ? 0 : -ENOMEM;
+  }
+  sd_bus_message_unref(reply);
   return r;
+}
+
+// A mapping that's extended may have been granted already. One that's gone
+// already has its signals waiting.
+[[nodiscard]] static int
+check_granted(sd_bus *bus, sd_bus_error *error, wait_t *wait) {
+  int const r = sd_bus_get_property_trivial(
+      bus, PORTD1_NAME, wait->path, PORTD1_MAPPING_INTERFACE, "ExternalPort",
+      error, 'q', &wait->external_port);
+  if (sd_bus_error_has_name(error, SD_BUS_ERROR_UNKNOWN_OBJECT)) {
+    sd_bus_error_free(error);
+    return 0;
+  }
+  if (r < 0) {
+    return r;
+  }
+  wait->done = wait->external_port != 0;
+  return 0;
 }
 
 [[nodiscard]] static int run_until_done(sd_bus *bus, wait_t *wait) {
@@ -431,6 +560,7 @@ static int on_interfaces_removed(sd_bus_message *message,
     if (r > 0) {
       continue;
     }
+
     uint64_t timeout = UINT64_MAX;
     if (!told) {
       uint64_t const waited = now(CLOCK_MONOTONIC) - start;
@@ -449,63 +579,59 @@ static int on_interfaces_removed(sd_bus_message *message,
   return 0;
 }
 
-static int map(sd_bus *bus, int argc, char *argv[]) {
-  static struct option const options[] = {
-      {"lifetime", required_argument, nullptr, 'l'},
-      {},
-  };
-  uint32_t lifetime = DEFAULT_LIFETIME;
-  int option;
-  while ((option = getopt_long(argc, argv, "l:", options, nullptr)) != -1) {
-    if (option != 'l' || !parse_lifetime(optarg, &lifetime)) {
-      fputs(USAGE, stderr);
-      return 2;
-    }
+// Until the gateway grants the mapping or portd gives up on it
+[[nodiscard]] static int wait_for_mapping(sd_bus *bus,
+                                          sd_bus_error *error,
+                                          char const *protocol,
+                                          uint16_t port,
+                                          uint32_t lifetime,
+                                          wait_t *wait) {
+  int r = watch(bus, wait);
+  if (r < 0) {
+    return r;
   }
+  r = request_mapping(bus, error, protocol, port, lifetime, wait);
+  if (r < 0) {
+    return r;
+  }
+  r = check_granted(bus, error, wait);
+  if (r < 0) {
+    return r;
+  }
+  return run_until_done(bus, wait);
+}
+
+[[nodiscard]] static int print_granted(sd_bus *bus,
+                                       sd_bus_error *error,
+                                       uint16_t port,
+                                       char const *protocol,
+                                       uint16_t external_port) {
+  char *external = nullptr;
+  int const r = get_string(bus, "ExternalAddress", error, &external);
+  if (r < 0) {
+    return r;
+  }
+
+  printf("%u/%s reachable at %s%s%u\n", (unsigned)port, protocol, external,
+         external[0] != '\0' ? ":" : "port ", (unsigned)external_port);
+  free(external);
+  return 0;
+}
+
+static int map(sd_bus *bus, int argc, char *argv[]) {
   uint16_t port;
   char const *protocol;
-  if (optind != argc - 1 || !parse_port(argv[optind], &port, &protocol)) {
+  uint32_t lifetime;
+  if (!parse_map_arguments(argc, argv, &port, &protocol, &lifetime)) {
     fputs(USAGE, stderr);
     return 2;
   }
 
   sd_bus_error error = SD_BUS_ERROR_NULL;
-  sd_bus_message *reply = nullptr;
-  char *external = nullptr;
   wait_t wait = {};
-  int r = watch(bus, &wait);
-  if (r >= 0) {
-    r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
-                           PORTD1_MANAGER_INTERFACE, "Map", &error, &reply,
-                           "squa{sv}", protocol, port, lifetime, 0);
-  }
-  char const *path;
-  if (r >= 0) {
-    r = sd_bus_message_read(reply, "o", &path);
-  }
-  if (r >= 0) {
-    wait.path = strdup(path);
-    r = wait.path != nullptr ? 0 : -ENOMEM;
-  }
-  // A mapping that's extended may have been granted already. One that's gone
-  // already has its signals waiting.
-  if (r >= 0) {
-    r = sd_bus_get_property_trivial(bus, PORTD1_NAME, wait.path,
-                                    PORTD1_MAPPING_INTERFACE, "ExternalPort",
-                                    &error, 'q', &wait.external_port);
-    if (sd_bus_error_has_name(&error, SD_BUS_ERROR_UNKNOWN_OBJECT)) {
-      sd_bus_error_free(&error);
-      r = 0;
-    }
-    wait.done = wait.external_port != 0;
-  }
-  if (r >= 0) {
-    r = run_until_done(bus, &wait);
-  }
+  int r = wait_for_mapping(bus, &error, protocol, port, lifetime, &wait);
   if (r >= 0 && wait.external_port != 0) {
-    r = sd_bus_get_property_string(bus, PORTD1_NAME, PORTD1_PATH,
-                                   PORTD1_MANAGER_INTERFACE, "ExternalAddress",
-                                   &error, &external);
+    r = print_granted(bus, &error, port, protocol, wait.external_port);
   }
 
   int result = EXIT_FAILURE;
@@ -513,8 +639,6 @@ static int map(sd_bus *bus, int argc, char *argv[]) {
     fprintf(stderr, "portctl: mapping %u/%s: %s\n", (unsigned)port, protocol,
             sd_bus_error_is_set(&error) ? error.message : strerror(-r));
   } else if (wait.external_port != 0) {
-    printf("%u/%s reachable at %s%s%u\n", (unsigned)port, protocol, external,
-           external[0] != '\0' ? ":" : "port ", (unsigned)wait.external_port);
     result = EXIT_SUCCESS;
   } else if (wait.reason != nullptr) {
     fprintf(stderr, "portctl: %u/%s failed: %s\n", (unsigned)port, protocol,
@@ -523,10 +647,9 @@ static int map(sd_bus *bus, int argc, char *argv[]) {
     fprintf(stderr, "portctl: %u/%s went away before the gateway granted it\n",
             (unsigned)port, protocol);
   }
-  free(external);
+
   free(wait.reason);
   free(wait.path);
-  sd_bus_message_unref(reply);
   sd_bus_error_free(&error);
   return result;
 }
@@ -542,11 +665,33 @@ typedef struct search {
 static void
 find_mapping(void *userdata, char const *path, mapping_t const *mapping) {
   search_t *search = userdata;
-  if (search->path == nullptr && mapping->port == search->port &&
-      strcmp(mapping->protocol, search->protocol) == 0) {
-    search->path = strdup(path);
-    search->out_of_memory = search->path == nullptr;
+  if (search->path != nullptr) {
+    return;
   }
+  if (mapping->port != search->port ||
+      strcmp(mapping->protocol, search->protocol) != 0) {
+    return;
+  }
+
+  search->path = strdup(path);
+  search->out_of_memory = search->path == nullptr;
+}
+
+// Leaves the path null if there's no such mapping
+[[nodiscard]] static int
+search_mappings(sd_bus *bus, sd_bus_error *error, search_t *search) {
+  sd_bus_message *reply = nullptr;
+  int r = get_mappings(bus, error, &reply);
+  if (r < 0) {
+    return r;
+  }
+
+  r = for_each_mapping(reply, find_mapping, search);
+  sd_bus_message_unref(reply);
+  if (r < 0) {
+    return r;
+  }
+  return search->out_of_memory ? -ENOMEM : 0;
 }
 
 static int release(sd_bus *bus, char const *text) {
@@ -557,14 +702,7 @@ static int release(sd_bus *bus, char const *text) {
   }
 
   sd_bus_error error = SD_BUS_ERROR_NULL;
-  sd_bus_message *reply = nullptr;
-  int r = get_mappings(bus, &error, &reply);
-  if (r >= 0) {
-    r = for_each_mapping(reply, find_mapping, &search);
-  }
-  if (r >= 0 && search.out_of_memory) {
-    r = -ENOMEM;
-  }
+  int r = search_mappings(bus, &error, &search);
   if (r >= 0 && search.path != nullptr) {
     r = sd_bus_call_method(bus, PORTD1_NAME, search.path,
                            PORTD1_MAPPING_INTERFACE, "Release", &error, nullptr,
@@ -580,8 +718,8 @@ static int release(sd_bus *bus, char const *text) {
   } else {
     result = EXIT_SUCCESS;
   }
+
   free(search.path);
-  sd_bus_message_unref(reply);
   sd_bus_error_free(&error);
   return result;
 }
