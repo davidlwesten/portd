@@ -1,5 +1,7 @@
 #include "bus.h"
 
+#include "dbus.h"
+
 #include <arpa/inet.h>
 #include <errno.h>
 #include <inttypes.h>
@@ -8,11 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static char const NAME[] = "io.github.davidlwesten.Portd1";
-static char const PATH[] = "/io/github/davidlwesten/Portd1";
 static char const MAPPINGS_PATH[] = "/io/github/davidlwesten/Portd1/mapping";
-static char const MANAGER_INTERFACE[] = "io.github.davidlwesten.Portd1.Manager";
-static char const MAPPING_INTERFACE[] = "io.github.davidlwesten.Portd1.Mapping";
 static char const ALREADY_MAPPED[] =
     "io.github.davidlwesten.Portd1.Error.AlreadyMapped";
 
@@ -147,8 +145,8 @@ on_map(sd_bus_message *message, void *userdata, sd_bus_error *error) {
   if (existing != nullptr) {
     if (existing->owner != uid) {
       return sd_bus_error_setf(error, ALREADY_MAPPED,
-                               "%s/%u is mapped by another user", protocol_name,
-                               (unsigned)port);
+                               "%u/%s is mapped by another user",
+                               (unsigned)port, protocol_name);
     }
     id = existing->id;
     client_extend(bus->client, id, lifetime);
@@ -375,11 +373,11 @@ int bus_start(bus_t *bus, sd_event *event, client_t *client) {
     r = sd_bus_attach_event(bus->bus, event, SD_EVENT_PRIORITY_NORMAL);
   }
   if (r >= 0) {
-    r = sd_bus_add_object_vtable(bus->bus, nullptr, PATH, MANAGER_INTERFACE,
-                                 manager_vtable, bus);
+    r = sd_bus_add_object_vtable(bus->bus, nullptr, MANAGER_PATH,
+                                 MANAGER_INTERFACE, manager_vtable, bus);
   }
   if (r >= 0) {
-    r = sd_bus_add_object_manager(bus->bus, nullptr, PATH);
+    r = sd_bus_add_object_manager(bus->bus, nullptr, MANAGER_PATH);
   }
   if (r >= 0) {
     r = sd_bus_add_fallback_vtable(bus->bus, nullptr, MAPPINGS_PATH,
@@ -391,7 +389,7 @@ int bus_start(bus_t *bus, sd_event *event, client_t *client) {
                                    enumerate_mappings, bus);
   }
   if (r >= 0) {
-    r = sd_bus_request_name(bus->bus, NAME, 0);
+    r = sd_bus_request_name(bus->bus, BUS_NAME, 0);
   }
   if (r < 0) {
     bus_stop(bus);
@@ -451,7 +449,7 @@ void bus_mapping_removed(void *userdata,
 void bus_gateway_changed(void *userdata) {
   bus_t const *bus = userdata;
   int const r = sd_bus_emit_properties_changed(
-      bus->bus, PATH, MANAGER_INTERFACE, "Gateway", "GatewayProtocol",
+      bus->bus, MANAGER_PATH, MANAGER_INTERFACE, "Gateway", "GatewayProtocol",
       "ExternalAddress", nullptr);
   if (r < 0) {
     fprintf(stderr, "portd: announcing the gateway: %s\n", strerror(-r));
