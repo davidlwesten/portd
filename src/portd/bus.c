@@ -1,6 +1,6 @@
 #include "bus.h"
 
-#include "portd1.h"
+#include "dbus.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -151,8 +151,7 @@ on_map(sd_bus_message *message, void *userdata, sd_bus_error *error) {
     id = existing->id;
     client_extend(bus->client, id, lifetime);
     r = sd_bus_emit_properties_changed(bus->bus, path_of(id).value,
-                                       PORTD1_MAPPING_INTERFACE, "Expires",
-                                       nullptr);
+                                       MAPPING_INTERFACE, "Expires", nullptr);
   } else {
     if (uid != 0 && mappings_of(bus->client, uid) >= MAPPINGS_PER_USER) {
       return sd_bus_error_setf(error, SD_BUS_ERROR_LIMITS_EXCEEDED,
@@ -374,15 +373,15 @@ int bus_start(bus_t *bus, sd_event *event, client_t *client) {
     r = sd_bus_attach_event(bus->bus, event, SD_EVENT_PRIORITY_NORMAL);
   }
   if (r >= 0) {
-    r = sd_bus_add_object_vtable(bus->bus, nullptr, PORTD1_PATH,
-                                 PORTD1_MANAGER_INTERFACE, manager_vtable, bus);
+    r = sd_bus_add_object_vtable(bus->bus, nullptr, MANAGER_PATH,
+                                 MANAGER_INTERFACE, manager_vtable, bus);
   }
   if (r >= 0) {
-    r = sd_bus_add_object_manager(bus->bus, nullptr, PORTD1_PATH);
+    r = sd_bus_add_object_manager(bus->bus, nullptr, MANAGER_PATH);
   }
   if (r >= 0) {
     r = sd_bus_add_fallback_vtable(bus->bus, nullptr, MAPPINGS_PATH,
-                                   PORTD1_MAPPING_INTERFACE, mapping_vtable,
+                                   MAPPING_INTERFACE, mapping_vtable,
                                    find_mapping, bus);
   }
   if (r >= 0) {
@@ -390,7 +389,7 @@ int bus_start(bus_t *bus, sd_event *event, client_t *client) {
                                    enumerate_mappings, bus);
   }
   if (r >= 0) {
-    r = sd_bus_request_name(bus->bus, PORTD1_NAME, 0);
+    r = sd_bus_request_name(bus->bus, BUS_NAME, 0);
   }
   if (r < 0) {
     bus_stop(bus);
@@ -420,8 +419,8 @@ static char const *failure_name(nat_result_t result) {
 void bus_mapping_changed(void *userdata, mapping_t const *mapping) {
   bus_t const *bus = userdata;
   int const r = sd_bus_emit_properties_changed(
-      bus->bus, path_of(mapping->id).value, PORTD1_MAPPING_INTERFACE,
-      "ExternalPort", nullptr);
+      bus->bus, path_of(mapping->id).value, MAPPING_INTERFACE, "ExternalPort",
+      nullptr);
   if (r < 0) {
     fprintf(stderr, "portd: announcing mapping %" PRIu64 ": %s\n", mapping->id,
             strerror(-r));
@@ -435,8 +434,8 @@ void bus_mapping_removed(void *userdata,
   mapping_path_t const path = path_of(mapping->id);
   int r = 0;
   if (failure != nullptr) {
-    r = sd_bus_emit_signal(bus->bus, path.value, PORTD1_MAPPING_INTERFACE,
-                           "Failed", "s", failure_name(*failure));
+    r = sd_bus_emit_signal(bus->bus, path.value, MAPPING_INTERFACE, "Failed",
+                           "s", failure_name(*failure));
   }
   if (r >= 0) {
     r = sd_bus_emit_object_removed(bus->bus, path.value);
@@ -450,8 +449,8 @@ void bus_mapping_removed(void *userdata,
 void bus_gateway_changed(void *userdata) {
   bus_t const *bus = userdata;
   int const r = sd_bus_emit_properties_changed(
-      bus->bus, PORTD1_PATH, PORTD1_MANAGER_INTERFACE, "Gateway",
-      "GatewayProtocol", "ExternalAddress", nullptr);
+      bus->bus, MANAGER_PATH, MANAGER_INTERFACE, "Gateway", "GatewayProtocol",
+      "ExternalAddress", nullptr);
   if (r < 0) {
     fprintf(stderr, "portd: announcing the gateway: %s\n", strerror(-r));
   }

@@ -7,8 +7,8 @@
 #include <systemd/sd-bus.h>
 
 #include "bus.h"
+#include "dbus.h"
 #include "portctl.h"
-#include "portd1.h"
 
 typedef struct search {
   uint16_t port;
@@ -53,9 +53,8 @@ int release(sd_bus *bus, char const *text) {
   sd_bus_error error = SD_BUS_ERROR_NULL;
   int r = search_mappings(bus, &error, &search);
   if (r >= 0 && search.path != nullptr) {
-    r = sd_bus_call_method(bus, PORTD1_NAME, search.path,
-                           PORTD1_MAPPING_INTERFACE, "Release", &error, nullptr,
-                           "");
+    r = sd_bus_call_method(bus, BUS_NAME, search.path, MAPPING_INTERFACE,
+                           "Release", &error, nullptr, "");
   }
 
   int result = EXIT_FAILURE;

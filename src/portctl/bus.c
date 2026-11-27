@@ -3,7 +3,7 @@
 #include <string.h>
 
 #include "bus.h"
-#include "portd1.h"
+#include "dbus.h"
 
 // Reads one property of a Mapping interface, skipping those it doesn't know
 [[nodiscard]] static int read_property(sd_bus_message *reply,
@@ -68,7 +68,7 @@ int read_mapping(sd_bus_message *reply, mapping_t *mapping) {
   if (r < 0) {
     return r;
   }
-  if (strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
+  if (strcmp(interface, MAPPING_INTERFACE) != 0) {
     return sd_bus_message_skip(reply, "a{sv}");
   }
 
@@ -147,7 +147,7 @@ int for_each_mapping(sd_bus *bus,
                      visit_t *visit,
                      void *userdata) {
   sd_bus_message *reply = nullptr;
-  int r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
+  int r = sd_bus_call_method(bus, BUS_NAME, MANAGER_PATH,
                              "org.freedesktop.DBus.ObjectManager",
                              "GetManagedObjects", error, &reply, "");
   if (r < 0) {
@@ -166,9 +166,9 @@ int request_mapping(sd_bus *bus,
                     uint32_t lifetime,
                     char **path) {
   sd_bus_message *reply = nullptr;
-  int r = sd_bus_call_method(bus, PORTD1_NAME, PORTD1_PATH,
-                             PORTD1_MANAGER_INTERFACE, "Map", error, &reply,
-                             "squa{sv}", protocol, port, lifetime, 0);
+  int r = sd_bus_call_method(bus, BUS_NAME, MANAGER_PATH, MANAGER_INTERFACE,
+                             "Map", error, &reply, "squa{sv}", protocol, port,
+                             lifetime, 0);
   if (r < 0) {
     return r;
   }
@@ -187,7 +187,6 @@ int get_string(sd_bus *bus,
                char const *property,
                sd_bus_error *error,
                char **value) {
-  return sd_bus_get_property_string(bus, PORTD1_NAME, PORTD1_PATH,
-                                    PORTD1_MANAGER_INTERFACE, property, error,
-                                    value);
+  return sd_bus_get_property_string(bus, BUS_NAME, MANAGER_PATH,
+                                    MANAGER_INTERFACE, property, error, value);
 }

@@ -9,8 +9,8 @@
 #include <systemd/sd-bus.h>
 
 #include "bus.h"
+#include "dbus.h"
 #include "portctl.h"
-#include "portd1.h"
 
 static constexpr uint32_t DEFAULT_LIFETIME = 3600;
 // How long to wait before saying the gateway hasn't answered yet
@@ -98,7 +98,7 @@ static int on_properties_changed(sd_bus_message *message,
   if (r < 0) {
     return r;
   }
-  if (strcmp(interface, PORTD1_MAPPING_INTERFACE) != 0) {
+  if (strcmp(interface, MAPPING_INTERFACE) != 0) {
     return 0;
   }
 
@@ -148,18 +148,18 @@ static int on_interfaces_removed(sd_bus_message *message,
 
 // Watches before mapping, so no answer from the gateway can be missed
 [[nodiscard]] static int watch(sd_bus *bus, wait_t *wait) {
-  int r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
+  int r = sd_bus_match_signal(bus, nullptr, BUS_NAME, nullptr,
                               "org.freedesktop.DBus.Properties",
                               "PropertiesChanged", on_properties_changed, wait);
   if (r < 0) {
     return r;
   }
-  r = sd_bus_match_signal(bus, nullptr, PORTD1_NAME, nullptr,
-                          PORTD1_MAPPING_INTERFACE, "Failed", on_failed, wait);
+  r = sd_bus_match_signal(bus, nullptr, BUS_NAME, nullptr, MAPPING_INTERFACE,
+                          "Failed", on_failed, wait);
   if (r < 0) {
     return r;
   }
-  return sd_bus_match_signal(bus, nullptr, PORTD1_NAME, PORTD1_PATH,
+  return sd_bus_match_signal(bus, nullptr, BUS_NAME, MANAGER_PATH,
                              "org.freedesktop.DBus.ObjectManager",
                              "InterfacesRemoved", on_interfaces_removed, wait);
 }
@@ -168,9 +168,9 @@ static int on_interfaces_removed(sd_bus_message *message,
 // already has its signals waiting.
 [[nodiscard]] static int
 check_granted(sd_bus *bus, sd_bus_error *error, wait_t *wait) {
-  int const r = sd_bus_get_property_trivial(
-      bus, PORTD1_NAME, wait->path, PORTD1_MAPPING_INTERFACE, "ExternalPort",
-      error, 'q', &wait->external_port);
+  int const r = sd_bus_get_property_trivial(bus, BUS_NAME, wait->path,
+                                            MAPPING_INTERFACE, "ExternalPort",
+                                            error, 'q', &wait->external_port);
   if (sd_bus_error_has_name(error, SD_BUS_ERROR_UNKNOWN_OBJECT)) {
     sd_bus_error_free(error);
     return 0;
